@@ -17,6 +17,7 @@
 
 #include "ExecutionState.h"
 #include "UserSearcher.h"
+#include "klee/Support/BranchDecision.h" // NEW
 
 #include "klee/ADT/RNG.h"
 #include "klee/Core/BranchTypes.h"
@@ -508,6 +509,9 @@ private:
   /// Only for debug purposes; enable via debugger or klee-control
   void dumpStates();
   void dumpExecutionTree();
+
+  // NEW writes control flow information to JSON file
+  void writeControlFlowJson(const ExecutionState &state) const;
 
 public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,

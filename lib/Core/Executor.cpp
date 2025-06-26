@@ -1142,12 +1142,42 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
+    //NEW adds branch to execution state
+    if (current.pc->inst->getDebugLoc()) {
+      auto loc = current.pc->inst->getDebugLoc();
+      std::string filename = loc->getFilename().str();
+      unsigned line = loc->getLine();
+
+      std::string condStr;
+      llvm::raw_string_ostream rso(condStr);
+      condition->print(rso);
+      rso.flush();
+
+      BranchDecision bd { filename, line, condStr, true };
+      current.controlFlowTrace.push_back(bd);
+    }
+
     return StatePair(&current, nullptr);
   } else if (res==Solver::False) {
     if (!isInternal) {
       if (pathWriter) {
         current.pathOS << "0";
       }
+    }
+
+    //NEW adds branch to execution state
+    if (current.pc->inst->getDebugLoc()) {
+      auto loc = current.pc->inst->getDebugLoc();
+      std::string filename = loc->getFilename().str();
+      unsigned line = loc->getLine();
+
+      std::string condStr;
+      llvm::raw_string_ostream rso(condStr);
+      condition->print(rso);
+      rso.flush();
+
+      BranchDecision bd { filename, line, condStr, false };
+      current.controlFlowTrace.push_back(bd);
     }
 
     return StatePair(nullptr, &current);
@@ -1223,6 +1253,24 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       terminateStateEarly(*trueState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       terminateStateEarly(*falseState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       return StatePair(nullptr, nullptr);
+    }
+
+    //NEW adds branches to both execution states
+    if (current.pc->inst->getDebugLoc()) {
+      auto loc = current.pc->inst->getDebugLoc();
+      std::string filename = loc->getFilename().str();
+      unsigned line = loc->getLine();
+
+      std::string condStr;
+      llvm::raw_string_ostream rso(condStr);
+      condition->print(rso);
+      rso.flush();
+
+      BranchDecision bdTrue { filename, line, condStr, true };
+      BranchDecision bdFalse { filename, line, condStr, false };
+
+      trueState->controlFlowTrace.push_back(bdTrue);
+      falseState->controlFlowTrace.push_back(bdFalse);
     }
 
     return StatePair(trueState, falseState);

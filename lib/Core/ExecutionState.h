@@ -13,6 +13,7 @@
 #include "AddressSpace.h"
 #include "MemoryManager.h"
 #include "MergeHandler.h"
+#include "klee/Support/BranchDecision.h" // NEW
 
 #include "klee/ADT/ImmutableSet.h"
 #include "klee/ADT/TreeStream.h"
@@ -247,6 +248,9 @@ public:
 
   /// @brief Disables forking for this state. Set by user code
   bool forkDisabled = false;
+
+  /// @brief NEW Records the branch decisions taken by this execution state.
+  std::vector<BranchDecision> controlFlowTrace;
 
   /// @brief Mapping symbolic address expressions to concrete base addresses
   using base_addrs_t = std::map<ref<Expr>, ref<ConstantExpr>>;

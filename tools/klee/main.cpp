@@ -65,6 +65,12 @@ DISABLE_WARNING_POP
 #include <iterator>
 #include <sstream>
 
+// NEW needed for JSON function
+#include "klee/Support/json.hpp"
+using json = nlohmann::json;
+#include "klee/Support/BranchDecision.h"
+#include "../../lib/Core/ExecutionState.h" // This is bad practice
+
 using namespace llvm;
 using namespace klee;
 
@@ -373,6 +379,9 @@ public:
   std::unique_ptr<llvm::raw_fd_ostream> openOutputFile(const std::string &filename);
   std::string getTestFilename(const std::string &suffix, unsigned id);
   std::unique_ptr<llvm::raw_fd_ostream> openTestFile(const std::string &suffix, unsigned id);
+  
+  //NEW writes control flow information to JSON file
+  void writeControlFlowTraceJSON(const ExecutionState &state, unsigned id);
 
   // load a .path file
   static void loadPathFile(std::string name,
@@ -606,6 +615,27 @@ void KleeHandler::writeTestCaseXML(
   *file << "</testcase>\n";
 }
 
+// NEW writes control flow information to JSON file, next to ktest file
+void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigned id) {
+  auto f = openTestFile("json", id);
+  if (!f)
+    return;
+
+  nlohmann::json j;
+  j["controlFlowTrace"] = nlohmann::json::array();
+
+  for (const auto &branchDecision : state.controlFlowTrace) {
+    j["controlFlowTrace"].push_back(json{
+    {"filename", branchDecision.filename},
+    {"line", branchDecision.line},
+    {"condition", branchDecision.condition},
+    {"taken", branchDecision.taken}
+    });
+  }
+
+  *f << j.dump(2); // pretty print with indent of 2 spaces
+}
+
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
 void KleeHandler::processTestCase(const ExecutionState &state,
                                   const char *errorMessage,
@@ -626,6 +656,9 @@ void KleeHandler::processTestCase(const ExecutionState &state,
         if (writeTestCaseKTest(assignments, test_id)) {
           atLeastOneGenerated = true;
         }
+
+        //NEW call to JSON file creation function
+        writeControlFlowTraceJSON(state, test_id);
       }
 
       if (WriteXMLTests) {

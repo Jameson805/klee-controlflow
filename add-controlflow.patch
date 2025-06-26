@@ -1,0 +1,221 @@
+diff --git a/lib/Core/CMakeLists.txt b/lib/Core/CMakeLists.txt
+index 021c3ce7..b340cd31 100644
+--- a/lib/Core/CMakeLists.txt
++++ b/lib/Core/CMakeLists.txt
+@@ -6,6 +6,7 @@
+ # License. See LICENSE.TXT for details.
+ #
+ #===------------------------------------------------------------------------===#
++
+ add_library(kleeCore
+   AddressSpace.cpp
+   MergeHandler.cpp
+@@ -29,16 +30,25 @@ add_library(kleeCore
+   UserSearcher.cpp
+ )
+ 
++find_package(PkgConfig REQUIRED)
++pkg_check_modules(JSONC json-c)
++
+ target_link_libraries(kleeCore PRIVATE
+   kleeBasic
+   kleeModule
+   kleaverSolver
+   kleaverExpr
+   kleeSupport
++  ${JSONC_LIBRARIES}
+ )
+ 
+ llvm_config(kleeCore "${USE_LLVM_SHARED}" core executionengine mcjit native support)
+ target_link_libraries(kleeCore PRIVATE ${SQLite3_LIBRARIES})
+-target_include_directories(kleeCore PRIVATE ${KLEE_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${SQLite3_INCLUDE_DIRS})
++target_include_directories(kleeCore PRIVATE
++  ${KLEE_INCLUDE_DIRS}
++  ${LLVM_INCLUDE_DIRS}
++  ${SQLite3_INCLUDE_DIRS}
++  ${JSONC_INCLUDE_DIRS}
++)
+ target_compile_options(kleeCore PRIVATE ${KLEE_COMPONENT_CXX_FLAGS})
+ target_compile_definitions(kleeCore PRIVATE ${KLEE_COMPONENT_CXX_DEFINES})
+diff --git a/lib/Core/ExecutionState.h b/lib/Core/ExecutionState.h
+index 0e28e04f..1fcbb852 100644
+--- a/lib/Core/ExecutionState.h
++++ b/lib/Core/ExecutionState.h
+@@ -13,6 +13,7 @@
+ #include "AddressSpace.h"
+ #include "MemoryManager.h"
+ #include "MergeHandler.h"
++#include "klee/Support/BranchDecision.h" // NEW
+ 
+ #include "klee/ADT/ImmutableSet.h"
+ #include "klee/ADT/TreeStream.h"
+@@ -248,6 +249,9 @@ public:
+   /// @brief Disables forking for this state. Set by user code
+   bool forkDisabled = false;
+ 
++  /// @brief NEW Records the branch decisions taken by this execution state.
++  std::vector<BranchDecision> controlFlowTrace;
++
+   /// @brief Mapping symbolic address expressions to concrete base addresses
+   using base_addrs_t = std::map<ref<Expr>, ref<ConstantExpr>>;
+   base_addrs_t base_addrs;
+diff --git a/lib/Core/Executor.cpp b/lib/Core/Executor.cpp
+index bc27c5f3..60dc0294 100644
+--- a/lib/Core/Executor.cpp
++++ b/lib/Core/Executor.cpp
+@@ -1142,6 +1142,21 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
+       }
+     }
+ 
++    //NEW adds branch to execution state
++    if (current.pc->inst->getDebugLoc()) {
++      auto loc = current.pc->inst->getDebugLoc();
++      std::string filename = loc->getFilename().str();
++      unsigned line = loc->getLine();
++
++      std::string condStr;
++      llvm::raw_string_ostream rso(condStr);
++      condition->print(rso);
++      rso.flush();
++
++      BranchDecision bd { filename, line, condStr, true };
++      current.controlFlowTrace.push_back(bd);
++    }
++
+     return StatePair(&current, nullptr);
+   } else if (res==Solver::False) {
+     if (!isInternal) {
+@@ -1150,6 +1165,21 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
+       }
+     }
+ 
++    //NEW adds branch to execution state
++    if (current.pc->inst->getDebugLoc()) {
++      auto loc = current.pc->inst->getDebugLoc();
++      std::string filename = loc->getFilename().str();
++      unsigned line = loc->getLine();
++
++      std::string condStr;
++      llvm::raw_string_ostream rso(condStr);
++      condition->print(rso);
++      rso.flush();
++
++      BranchDecision bd { filename, line, condStr, false };
++      current.controlFlowTrace.push_back(bd);
++    }
++
+     return StatePair(nullptr, &current);
+   } else {
+     TimerStatIncrementer timer(stats::forkTime);
+@@ -1225,6 +1255,24 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
+       return StatePair(nullptr, nullptr);
+     }
+ 
++    //NEW adds branches to both execution states
++    if (current.pc->inst->getDebugLoc()) {
++      auto loc = current.pc->inst->getDebugLoc();
++      std::string filename = loc->getFilename().str();
++      unsigned line = loc->getLine();
++
++      std::string condStr;
++      llvm::raw_string_ostream rso(condStr);
++      condition->print(rso);
++      rso.flush();
++
++      BranchDecision bdTrue { filename, line, condStr, true };
++      BranchDecision bdFalse { filename, line, condStr, false };
++
++      trueState->controlFlowTrace.push_back(bdTrue);
++      falseState->controlFlowTrace.push_back(bdFalse);
++    }
++
+     return StatePair(trueState, falseState);
+   }
+ }
+diff --git a/lib/Core/Executor.h b/lib/Core/Executor.h
+index 465751f6..2421507e 100644
+--- a/lib/Core/Executor.h
++++ b/lib/Core/Executor.h
+@@ -17,6 +17,7 @@
+ 
+ #include "ExecutionState.h"
+ #include "UserSearcher.h"
++#include "klee/Support/BranchDecision.h" // NEW
+ 
+ #include "klee/ADT/RNG.h"
+ #include "klee/Core/BranchTypes.h"
+@@ -509,6 +510,9 @@ private:
+   void dumpStates();
+   void dumpExecutionTree();
+ 
++  // NEW writes control flow information to JSON file
++  void writeControlFlowJson(const ExecutionState &state) const;
++
+ public:
+   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,
+       InterpreterHandler *ie);
+diff --git a/tools/klee/main.cpp b/tools/klee/main.cpp
+index 9e23e8af..228eab43 100644
+--- a/tools/klee/main.cpp
++++ b/tools/klee/main.cpp
+@@ -65,6 +65,12 @@ DISABLE_WARNING_POP
+ #include <iterator>
+ #include <sstream>
+ 
++// NEW needed for JSON function
++#include "klee/Support/json.hpp"
++using json = nlohmann::json;
++#include "klee/Support/BranchDecision.h"
++#include "../../lib/Core/ExecutionState.h" // This is bad practice
++
+ using namespace llvm;
+ using namespace klee;
+ 
+@@ -373,6 +379,9 @@ public:
+   std::unique_ptr<llvm::raw_fd_ostream> openOutputFile(const std::string &filename);
+   std::string getTestFilename(const std::string &suffix, unsigned id);
+   std::unique_ptr<llvm::raw_fd_ostream> openTestFile(const std::string &suffix, unsigned id);
++  
++  //NEW writes control flow information to JSON file
++  void writeControlFlowTraceJSON(const ExecutionState &state, unsigned id);
+ 
+   // load a .path file
+   static void loadPathFile(std::string name,
+@@ -606,6 +615,27 @@ void KleeHandler::writeTestCaseXML(
+   *file << "</testcase>\n";
+ }
+ 
++// NEW writes control flow information to JSON file, next to ktest file
++void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigned id) {
++  auto f = openTestFile("json", id);
++  if (!f)
++    return;
++
++  nlohmann::json j;
++  j["controlFlowTrace"] = nlohmann::json::array();
++
++  for (const auto &branchDecision : state.controlFlowTrace) {
++    j["controlFlowTrace"].push_back(json{
++    {"filename", branchDecision.filename},
++    {"line", branchDecision.line},
++    {"condition", branchDecision.condition},
++    {"taken", branchDecision.taken}
++    });
++  }
++
++  *f << j.dump(2); // pretty print with indent of 2 spaces
++}
++
+ /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
+ void KleeHandler::processTestCase(const ExecutionState &state,
+                                   const char *errorMessage,
+@@ -626,6 +656,9 @@ void KleeHandler::processTestCase(const ExecutionState &state,
+         if (writeTestCaseKTest(assignments, test_id)) {
+           atLeastOneGenerated = true;
+         }
++
++        //NEW call to JSON file creation function
++        writeControlFlowTraceJSON(state, test_id);
+       }
+ 
+       if (WriteXMLTests) {
