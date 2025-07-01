@@ -1127,14 +1127,18 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     }
   }
 
+  std::string filename;
+  unsigned line = 0;
+  std::string condStr;
+  if (current.pc->inst->getDebugLoc()) {
+    auto loc = current.pc->inst->getDebugLoc();
+    filename = loc->getFilename().str();
+    line = loc->getLine();
+    llvm::raw_string_ostream rso(condStr);
+    condition->print(rso);
+    rso.flush();
+  }
 
-  // XXX - even if the constraint is provable one way or the other we
-  // can probably benefit by adding this constraint and allowing it to
-  // reduce the other constraints. For example, if we do a binary
-  // search on a particular value, and then see a comparison against
-  // the value it has been fixed at, we should take this as a nice
-  // hint to just use the single constraint instead of all the binary
-  // search ones. If that makes sense.
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
@@ -1142,20 +1146,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
-    //NEW adds branch to execution state
-    if (current.pc->inst->getDebugLoc()) {
-      auto loc = current.pc->inst->getDebugLoc();
-      std::string filename = loc->getFilename().str();
-      unsigned line = loc->getLine();
-
-      std::string condStr;
-      llvm::raw_string_ostream rso(condStr);
-      condition->print(rso);
-      rso.flush();
-
-      BranchDecision bd { filename, line, condStr, true };
-      current.controlFlowTrace.push_back(bd);
-    }
+    if (!filename.empty())
+      current.controlFlowTrace.push_back({filename, line, condStr, true});
 
     return StatePair(&current, nullptr);
   } else if (res==Solver::False) {
@@ -1165,20 +1157,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
-    //NEW adds branch to execution state
-    if (current.pc->inst->getDebugLoc()) {
-      auto loc = current.pc->inst->getDebugLoc();
-      std::string filename = loc->getFilename().str();
-      unsigned line = loc->getLine();
-
-      std::string condStr;
-      llvm::raw_string_ostream rso(condStr);
-      condition->print(rso);
-      rso.flush();
-
-      BranchDecision bd { filename, line, condStr, false };
-      current.controlFlowTrace.push_back(bd);
-    }
+    if (!filename.empty())
+      current.controlFlowTrace.push_back({filename, line, condStr, false});
 
     return StatePair(nullptr, &current);
   } else {
@@ -1255,17 +1235,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       return StatePair(nullptr, nullptr);
     }
 
-    //NEW adds branches to both execution states
-    if (current.pc->inst->getDebugLoc()) {
-      auto loc = current.pc->inst->getDebugLoc();
-      std::string filename = loc->getFilename().str();
-      unsigned line = loc->getLine();
-
-      std::string condStr;
-      llvm::raw_string_ostream rso(condStr);
-      condition->print(rso);
-      rso.flush();
-
+    if (!filename.empty()) {
       BranchDecision bdTrue { filename, line, condStr, true };
       BranchDecision bdFalse { filename, line, condStr, false };
 
