@@ -13,7 +13,7 @@
 #include "AddressSpace.h"
 #include "MemoryManager.h"
 #include "MergeHandler.h"
-#include "klee/Support/BranchDecision.h" // NEW
+#include "klee/Support/BranchDecision.h"
 
 #include "klee/ADT/ImmutableSet.h"
 #include "klee/ADT/TreeStream.h"

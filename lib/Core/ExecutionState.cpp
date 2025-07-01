@@ -18,6 +18,7 @@
 #include "klee/Module/KModule.h"
 #include "klee/Support/Casting.h"
 #include "klee/Support/OptionCategories.h"
+#include "klee/Support/BranchDecision.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"
@@ -117,7 +118,8 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     coveredNew(state.coveredNew),
     forkDisabled(state.forkDisabled),
     base_addrs(state.base_addrs),
-    base_mos(state.base_mos) {
+    base_mos(state.base_mos),
+    controlFlowTrace(state.controlFlowTrace) {
   for (const auto &cur_mergehandler: openMergeStack)
     cur_mergehandler->addOpenState(this);
 }
