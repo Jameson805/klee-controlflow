@@ -1070,7 +1070,6 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       } else if (res==Solver::False) {
         assert(!branch && "hit invalid branch in replay path mode");
       } else {
-        // add constraints
         if(branch) {
           res = Solver::True;
           addConstraint(current, condition);
@@ -1096,13 +1095,10 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     }
   }
 
-  // Fix branch in only-replay-seed mode, if we don't have both true
-  // and false seeds.
   if (isSeeding && 
       (current.forkDisabled || OnlyReplaySeeds) && 
       res == Solver::Unknown) {
     bool trueSeed=false, falseSeed=false;
-    // Is seed extension still ok here?
     for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
            siie = it->second.end(); siit != siie; ++siit) {
       ref<ConstantExpr> res;
@@ -1139,6 +1135,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     rso.flush();
   }
 
+  bool skipLogging = isa<ConstantExpr>(condition);
+ 
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
@@ -1146,7 +1144,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
-    if (!filename.empty())
+    if (!skipLogging && !filename.empty())
       current.controlFlowTrace.push_back({filename, line, condStr, true});
 
     return StatePair(&current, nullptr);
@@ -1157,7 +1155,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
-    if (!filename.empty())
+    if (!skipLogging && !filename.empty())
       current.controlFlowTrace.push_back({filename, line, condStr, false});
 
     return StatePair(nullptr, &current);
@@ -1209,8 +1207,6 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     stats::incBranchStat(reason, 1);
 
     if (pathWriter) {
-      // Need to update the pathOS.id field of falseState, otherwise the same id
-      // is used for both falseState and trueState.
       falseState->pathOS = pathWriter->open(current.pathOS);
       if (!isInternal) {
         trueState->pathOS << "1";
@@ -1228,14 +1224,13 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     addConstraint(*trueState, condition);
     addConstraint(*falseState, Expr::createIsZero(condition));
 
-    // Kinda gross, do we even really still want this option?
     if (MaxDepth && MaxDepth<=trueState->depth) {
       terminateStateEarly(*trueState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       terminateStateEarly(*falseState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       return StatePair(nullptr, nullptr);
     }
 
-    if (!filename.empty()) {
+    if (!skipLogging && !filename.empty()) {
       BranchDecision bdTrue { filename, line, condStr, true };
       BranchDecision bdFalse { filename, line, condStr, false };
 
