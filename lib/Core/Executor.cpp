@@ -1070,6 +1070,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       } else if (res==Solver::False) {
         assert(!branch && "hit invalid branch in replay path mode");
       } else {
+        // add constraints
         if(branch) {
           res = Solver::True;
           addConstraint(current, condition);
@@ -1095,10 +1096,13 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     }
   }
 
+  // Fix branch in only-replay-seed mode, if we don't have both true
+  // and false seeds.
   if (isSeeding && 
       (current.forkDisabled || OnlyReplaySeeds) && 
       res == Solver::Unknown) {
     bool trueSeed=false, falseSeed=false;
+    // Is seed extension still ok here?
     for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
            siie = it->second.end(); siit != siie; ++siit) {
       ref<ConstantExpr> res;
@@ -1123,29 +1127,20 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     }
   }
 
-  std::string filename;
-  unsigned line = 0;
-  std::string condStr;
-  if (current.pc->inst->getDebugLoc()) {
-    auto loc = current.pc->inst->getDebugLoc();
-    filename = loc->getFilename().str();
-    line = loc->getLine();
-    llvm::raw_string_ostream rso(condStr);
-    condition->print(rso);
-    rso.flush();
-  }
 
-  bool skipLogging = isa<ConstantExpr>(condition);
- 
+  // XXX - even if the constraint is provable one way or the other we
+  // can probably benefit by adding this constraint and allowing it to
+  // reduce the other constraints. For example, if we do a binary
+  // search on a particular value, and then see a comparison against
+  // the value it has been fixed at, we should take this as a nice
+  // hint to just use the single constraint instead of all the binary
+  // search ones. If that makes sense.
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
         current.pathOS << "1";
       }
     }
-
-    if (!skipLogging && !filename.empty())
-      current.controlFlowTrace.push_back({filename, line, condStr, true});
 
     return StatePair(&current, nullptr);
   } else if (res==Solver::False) {
@@ -1154,9 +1149,6 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
         current.pathOS << "0";
       }
     }
-
-    if (!skipLogging && !filename.empty())
-      current.controlFlowTrace.push_back({filename, line, condStr, false});
 
     return StatePair(nullptr, &current);
   } else {
@@ -1207,6 +1199,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     stats::incBranchStat(reason, 1);
 
     if (pathWriter) {
+      // Need to update the pathOS.id field of falseState, otherwise the same id
+      // is used for both falseState and trueState.
       falseState->pathOS = pathWriter->open(current.pathOS);
       if (!isInternal) {
         trueState->pathOS << "1";
@@ -1224,18 +1218,11 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     addConstraint(*trueState, condition);
     addConstraint(*falseState, Expr::createIsZero(condition));
 
+    // Kinda gross, do we even really still want this option?
     if (MaxDepth && MaxDepth<=trueState->depth) {
       terminateStateEarly(*trueState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       terminateStateEarly(*falseState, "max-depth exceeded.", StateTerminationType::MaxDepth);
       return StatePair(nullptr, nullptr);
-    }
-
-    if (!skipLogging && !filename.empty()) {
-      BranchDecision bdTrue { filename, line, condStr, true };
-      BranchDecision bdFalse { filename, line, condStr, false };
-
-      trueState->controlFlowTrace.push_back(bdTrue);
-      falseState->controlFlowTrace.push_back(bdFalse);
     }
 
     return StatePair(trueState, falseState);
@@ -2241,6 +2228,23 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       cond = optimizer.optimizeExpr(cond, false);
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
+      // Get branch location in source code
+      std::string filename;
+      unsigned line = 0;
+      unsigned col = 0;
+      std::string condStr;
+      if (i->getDebugLoc()) {
+        auto loc = i->getDebugLoc();
+        filename = loc->getFilename().str();
+        line = loc.getLine();
+        col = loc.getCol();
+        llvm::raw_string_ostream rso(condStr);
+        cond->print(rso);
+        rso.flush();
+      }
+      // Only consider non-constant branch conditions
+      bool skipLogging = isa<ConstantExpr>(cond);
+
       // NOTE: There is a hidden dependency here, markBranchVisited
       // requires that we still be in the context of the branch
       // instruction (it reuses its statistic id). Should be cleaned
@@ -2249,9 +2253,21 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         statsTracker->markBranchVisited(branches.first, branches.second);
 
       if (branches.first)
+      {
+        if (!skipLogging && !filename.empty())
+        {
+          state.controlFlowTrace.push_back({filename, line, col, condStr, true});
+        }
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
+      }
       if (branches.second)
+      {
+        if (!skipLogging && !filename.empty())
+        {
+          state.controlFlowTrace.push_back({filename, line, col, condStr, false});
+        }
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
+      }
     }
     break;
   }

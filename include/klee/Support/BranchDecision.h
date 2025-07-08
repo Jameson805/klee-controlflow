@@ -14,6 +14,7 @@ namespace klee {
 struct BranchDecision {
   std::string filename;
   unsigned line;
+  unsigned col;
   std::string condition;
   bool taken;
 };

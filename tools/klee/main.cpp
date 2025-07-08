@@ -628,6 +628,7 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
     j["controlFlowTrace"].push_back(json{
     {"filename", branchDecision.filename},
     {"line", branchDecision.line},
+    {"col", branchDecision.col},
     {"condition", branchDecision.condition},
     {"taken", branchDecision.taken}
     });
