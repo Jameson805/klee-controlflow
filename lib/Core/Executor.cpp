@@ -2256,7 +2256,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          state.controlFlowTrace.push_back({filename, line, col, condStr, true});
+          (*branches.first).controlFlowTrace.push_back({filename, line, col, condStr, true});
         }
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
       }
@@ -2264,7 +2264,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          state.controlFlowTrace.push_back({filename, line, col, condStr, false});
+          (*branches.second).controlFlowTrace.push_back({filename, line, col, condStr, false});
         }
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       }
