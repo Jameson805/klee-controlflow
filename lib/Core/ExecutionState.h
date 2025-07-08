@@ -14,6 +14,7 @@
 #include "MemoryManager.h"
 #include "MergeHandler.h"
 #include "klee/Support/BranchDecision.h"
+#include "klee/Support/BothBranch.h"
 
 #include "klee/ADT/ImmutableSet.h"
 #include "klee/ADT/TreeStream.h"
@@ -251,6 +252,9 @@ public:
 
   /// @brief NEW Records the branch decisions taken by this execution state.
   std::vector<BranchDecision> controlFlowTrace;
+
+  /// @brief NEW Records the branches that can go in both ways
+  std::vector<BothBranch> bothBranches;
 
   /// @brief Mapping symbolic address expressions to concrete base addresses
   using base_addrs_t = std::map<ref<Expr>, ref<ConstantExpr>>;

@@ -368,7 +368,8 @@ public:
   bool writeTestCaseKTest(
       const std::vector<std::pair<std::string, std::vector<unsigned char>>>
           &out,
-      unsigned id);
+      unsigned id,
+      const std::string &suffix = "");
   void writeTestCaseXML(
       bool isError,
       const std::vector<std::pair<std::string, std::vector<unsigned char>>>
@@ -377,11 +378,13 @@ public:
 
   std::string getOutputFilename(const std::string &filename);
   std::unique_ptr<llvm::raw_fd_ostream> openOutputFile(const std::string &filename);
-  std::string getTestFilename(const std::string &suffix, unsigned id);
+  std::string getTestFilename(const std::string &suffix, unsigned id, const std::string &presuffix = "");
   std::unique_ptr<llvm::raw_fd_ostream> openTestFile(const std::string &suffix, unsigned id);
   
   //NEW writes control flow information to JSON file
   void writeControlFlowTraceJSON(const ExecutionState &state, unsigned id);
+  //NEW writes inputs for branches that can go both ways
+  void writeBothBranches(const ExecutionState &state, unsigned id);
 
   // load a .path file
   static void loadPathFile(std::string name,
@@ -513,9 +516,9 @@ KleeHandler::openOutputFile(const std::string &filename) {
   return f;
 }
 
-std::string KleeHandler::getTestFilename(const std::string &suffix, unsigned id) {
+std::string KleeHandler::getTestFilename(const std::string &suffix, unsigned id, const std::string &presuffix) {
   std::stringstream filename;
-  filename << "test" << std::setfill('0') << std::setw(6) << id << '.' << suffix;
+  filename << "test" << std::setfill('0') << std::setw(6) << id << presuffix << '.' << suffix;
   return filename.str();
 }
 
@@ -526,7 +529,8 @@ KleeHandler::openTestFile(const std::string &suffix, unsigned id) {
 
 bool KleeHandler::writeTestCaseKTest(
     const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,
-    unsigned id) {
+    unsigned id,
+    const std::string &suffix) {
   KTest b;
   b.numArgs = m_argc;
   b.args = m_argv;
@@ -545,7 +549,7 @@ bool KleeHandler::writeTestCaseKTest(
   }
   bool status = true;
   if (!kTest_toFile(&b,
-                    getOutputFilename(getTestFilename("ktest", id)).c_str())) {
+                    getOutputFilename(getTestFilename("ktest", id, suffix)).c_str())) {
     status = false;
     klee_warning("unable to write output test case, losing it");
   }
@@ -624,17 +628,28 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
   nlohmann::json j;
   j["controlFlowTrace"] = nlohmann::json::array();
 
+  unsigned branchId = 0;
   for (const auto &branchDecision : state.controlFlowTrace) {
     j["controlFlowTrace"].push_back(json{
+    {"branch_id", branchId},
     {"filename", branchDecision.filename},
     {"line", branchDecision.line},
     {"col", branchDecision.col},
     {"condition", branchDecision.condition},
     {"taken", branchDecision.taken}
     });
+    ++branchId;
   }
 
   *f << j.dump(2); // pretty print with indent of 2 spaces
+}
+
+void KleeHandler::writeBothBranches(const ExecutionState &state, unsigned id) {
+  for (const BothBranch &b : state.bothBranches)
+  {
+    writeTestCaseKTest(b.assignments.first, id, "_branch_" + std::to_string(b.branchId) + "_true");
+    writeTestCaseKTest(b.assignments.second, id, "_branch_" + std::to_string(b.branchId) + "_false");
+  }
 }
 
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
@@ -660,6 +675,8 @@ void KleeHandler::processTestCase(const ExecutionState &state,
 
         //NEW call to JSON file creation function
         writeControlFlowTraceJSON(state, test_id);
+        //NEW call to write inputs for branches that can go both ways
+        writeBothBranches(state, test_id);
       }
 
       if (WriteXMLTests) {

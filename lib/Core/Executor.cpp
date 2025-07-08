@@ -2252,6 +2252,20 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (statsTracker && state.stack.back().kf->trackCoverage)
         statsTracker->markBranchVisited(branches.first, branches.second);
 
+      // Record the branching state pairs if both directions are possible
+      if (branches.first && branches.second)
+      {
+        BothBranch::Assignments aTrue, aFalse;
+        bool sucTrue{this->getSymbolicSolution(*(branches.first), aTrue)};
+        bool sucFalse{this->getSymbolicSolution(*(branches.second), aFalse)};
+        if (sucTrue && sucFalse)
+        {
+          BothBranch b{static_cast<unsigned>(state.controlFlowTrace.size()), {aTrue, aFalse}};
+          (*branches.first).bothBranches.push_back(b);
+          (*branches.second).bothBranches.push_back(b);
+        }
+      }
+
       if (branches.first)
       {
         if (!skipLogging && !filename.empty())
