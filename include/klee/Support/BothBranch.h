@@ -16,7 +16,8 @@ namespace klee {
 class ExecutionState;
 
 struct BothBranch {
-  unsigned branchId;
+  uint64_t branchId;
+  unsigned instId;
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
   std::pair<Assignments, Assignments> assignments;
 };

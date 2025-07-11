@@ -628,27 +628,31 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
   nlohmann::json j;
   j["controlFlowTrace"] = nlohmann::json::array();
 
-  unsigned branchId = 0;
   for (const auto &branchDecision : state.controlFlowTrace) {
     j["controlFlowTrace"].push_back(json{
-    {"branch_id", branchId},
+    {"branch_id", branchDecision.branchId},
+    {"inst_id", branchDecision.instId},
     {"filename", branchDecision.filename},
     {"line", branchDecision.line},
     {"col", branchDecision.col},
     {"condition", branchDecision.condition},
     {"taken", branchDecision.taken}
     });
-    ++branchId;
   }
 
   *f << j.dump(2); // pretty print with indent of 2 spaces
 }
 
 void KleeHandler::writeBothBranches(const ExecutionState &state, unsigned id) {
+  static std::set<uint64_t> visited;
   for (const BothBranch &b : state.bothBranches)
   {
-    writeTestCaseKTest(b.assignments.first, id, "_branch_" + std::to_string(b.branchId) + "_true");
-    writeTestCaseKTest(b.assignments.second, id, "_branch_" + std::to_string(b.branchId) + "_false");
+    if (visited.find(b.instId) != visited.end()) continue;
+    visited.insert(b.instId);
+    writeTestCaseKTest(b.assignments.first, id,
+      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_true");
+    writeTestCaseKTest(b.assignments.second, id,
+      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_false");
   }
 }
 
