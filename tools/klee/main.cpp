@@ -631,6 +631,7 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
   for (const auto &branchDecision : state.controlFlowTrace) {
     j["controlFlowTrace"].push_back(json{
     {"branch_id", branchDecision.branchId},
+    {"inst_id", branchDecision.instId},
     {"filename", branchDecision.filename},
     {"line", branchDecision.line},
     {"col", branchDecision.col},
@@ -643,16 +644,15 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
 }
 
 void KleeHandler::writeBothBranches(const ExecutionState &state, unsigned id) {
-  static std::set<std::pair<unsigned, unsigned>> visited;
+  static std::set<uint64_t> visited;
   for (const BothBranch &b : state.bothBranches)
   {
-    std::pair<unsigned, unsigned> p{b.line, b.col};
-    if (visited.find(p) != visited.end()) continue;
-    visited.insert(p);
+    if (visited.find(b.instId) != visited.end()) continue;
+    visited.insert(b.instId);
     writeTestCaseKTest(b.assignments.first, id,
-      "_br_" + std::to_string(b.branchId) + "_l_" + std::to_string(b.line) + "_c_" + std::to_string(b.col) + "_true");
+      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_true");
     writeTestCaseKTest(b.assignments.second, id,
-      "_br_" + std::to_string(b.branchId) + "_l_" + std::to_string(b.line) + "_c_" + std::to_string(b.col) +"_false");
+      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_false");
   }
 }
 
