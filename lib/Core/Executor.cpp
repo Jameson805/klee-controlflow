@@ -2230,7 +2230,6 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
       uint64_t branchId{stats::branchId.getValue()};
       ++stats::branchId;
-      unsigned instId{ki->info->id};
       // Get branch location in source code
       std::string filename;
       unsigned line = 0;
@@ -2263,7 +2262,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         bool sucFalse{this->getSymbolicSolution(*(branches.second), aFalse)};
         if (sucTrue && sucFalse)
         {
-          BothBranch b{branchId, instId, {aTrue, aFalse}};
+          BothBranch b{branchId, line, col, {aTrue, aFalse}};
           (*branches.first).bothBranches.push_back(b);
           (*branches.second).bothBranches.push_back(b);
         }
@@ -2273,7 +2272,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          (*branches.first).controlFlowTrace.push_back({branchId, instId, filename, line, col, condStr, true});
+          (*branches.first).controlFlowTrace.push_back({branchId, filename, line, col, condStr, true});
         }
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
       }
@@ -2281,7 +2280,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          (*branches.second).controlFlowTrace.push_back({branchId, instId, filename, line, col, condStr, false});
+          (*branches.second).controlFlowTrace.push_back({branchId, filename, line, col, condStr, false});
         }
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       }

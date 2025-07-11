@@ -13,7 +13,6 @@ namespace klee {
 
 struct BranchDecision {
   uint64_t branchId;
-  unsigned instId;
   std::string filename;
   unsigned line;
   unsigned col;

@@ -17,7 +17,8 @@ class ExecutionState;
 
 struct BothBranch {
   uint64_t branchId;
-  unsigned instId;
+  unsigned line;
+  unsigned col;
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
   std::pair<Assignments, Assignments> assignments;
 };
