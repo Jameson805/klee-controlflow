@@ -507,9 +507,11 @@ ref<Expr>  NotOptimizedExpr::create(ref<Expr> src) {
 Array::Array(const std::string &_name, uint64_t _size,
              const ref<ConstantExpr> *constantValuesBegin,
              const ref<ConstantExpr> *constantValuesEnd, Expr::Width _domain,
-             Expr::Width _range)
+             Expr::Width _range,
+             bool isSecret)
     : name(_name), size(_size), domain(_domain), range(_range),
-      constantValues(constantValuesBegin, constantValuesEnd) {
+      constantValues(constantValuesBegin, constantValuesEnd),
+      isSecret(isSecret) {
 
   assert((isSymbolicArray() || constantValues.size() == size) &&
          "Invalid size for constant array!");

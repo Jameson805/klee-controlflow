@@ -28,6 +28,7 @@ DISABLE_WARNING_POP
 #include <set>
 #include <vector>
 #include <map>
+#include <iostream>
 
 namespace llvm {
   class Type;
@@ -366,6 +367,17 @@ inline std::stringstream &operator<<(std::stringstream &os, const Expr::Kind kin
   return os;
 }
 
+// NEW helper for printing expr to e.g. stdout
+inline std::ostream &operator<<(std::ostream &os, const ref<Expr> &e)
+{
+  std::string str;
+  llvm::raw_string_ostream rso(str);
+  e->print(rso);
+  rso.flush();
+  os << str;
+  return os;
+}
+
 // Utility classes
 
 class NonConstantExpr : public Expr {
@@ -508,6 +520,9 @@ public:
   /// the array size.
   const std::vector<ref<ConstantExpr> > constantValues;
 
+  // NEW: Is the array secret for side-channel analysis
+  const bool isSecret;
+
 private:
   unsigned hashValue;
 
@@ -529,7 +544,8 @@ private:
   Array(const std::string &_name, uint64_t _size,
         const ref<ConstantExpr> *constantValuesBegin = 0,
         const ref<ConstantExpr> *constantValuesEnd = 0,
-        Expr::Width _domain = Expr::Int32, Expr::Width _range = Expr::Int8);
+        Expr::Width _domain = Expr::Int32, Expr::Width _range = Expr::Int8,
+        bool isSecret = false);
 
 public:
   bool isSymbolicArray() const { return constantValues.empty(); }

@@ -109,6 +109,7 @@ static constexpr std::array handlerInfo = {
 #endif
   add("klee_is_symbolic", handleIsSymbolic, true),
   add("klee_make_symbolic", handleMakeSymbolic, false),
+  add("klee_make_symbolic_sc", handleMakeSymbolic, false), // NEW: Share handler with klee_make_symbolic()
   add("klee_mark_global", handleMarkGlobal, false),
   add("klee_open_merge", handleOpenMerge, false),
   add("klee_close_merge", handleCloseMerge, false),
@@ -773,14 +774,16 @@ void SpecialFunctionHandler::handleDefineFixedObject(ExecutionState &state,
   mo->isUserSpecified = true; // XXX hack;
 }
 
+// NEW: klee_make_symbolic_sc() shares handler with klee_make_symbolic()
 void SpecialFunctionHandler::handleMakeSymbolic(ExecutionState &state,
                                                 KInstruction *target,
                                                 std::vector<ref<Expr> > &arguments) {
   std::string name;
 
-  if (arguments.size() != 3) {
+  if (arguments.size() != 3 && arguments.size() != 4) {
     executor.terminateStateOnUserError(state,
-        "Incorrect number of arguments to klee_make_symbolic(void*, size_t, char*)");
+        "Incorrect number of arguments to klee_make_symbolic(void*, size_t, char*)"
+        " or klee_make_symbolic_sc(void*, size_t, char*, int)");
     return;
   }
 
@@ -818,7 +821,8 @@ void SpecialFunctionHandler::handleMakeSymbolic(ExecutionState &state,
     assert(success && "FIXME: Unhandled solver failure");
     
     if (res) {
-      executor.executeMakeSymbolic(*s, mo, name);
+      bool isSecret{arguments.size() == 4 ? !arguments[3]->isZero() : false};
+      executor.executeMakeSymbolic(*s, mo, name, isSecret);
     } else {      
       executor.terminateStateOnUserError(*s, "Wrong size given to klee_make_symbolic");
     }

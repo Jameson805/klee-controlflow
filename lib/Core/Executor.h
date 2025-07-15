@@ -190,6 +190,10 @@ private:
   /// Assumes ownership of the created array objects
   ArrayCache arrayCache;
 
+  /// NEW: Map from secret symbolic name to their prime (') copy
+  /// NOTE: This requires all symbolic names to be unique
+  std::map<std::string, const Array*> prime;
+
   /// File to print executed instructions to
   std::unique_ptr<llvm::raw_ostream> debugInstFile;
 
@@ -321,7 +325,8 @@ private:
                               KInstruction *target /* undef if write */);
 
   void executeMakeSymbolic(ExecutionState &state, const MemoryObject *mo,
-                           const std::string &name);
+                           const std::string &name,
+                           bool isSecret /* NEW */);
 
   /// Create a new state where each input condition has been added as
   /// a constraint and return the results. The input state is included
@@ -510,8 +515,16 @@ private:
   void dumpStates();
   void dumpExecutionTree();
 
-  // NEW writes control flow information to JSON file
+  // NEW: Writes control flow information to JSON file
   void writeControlFlowJson(const ExecutionState &state) const;
+
+  // NEW: Rename all secret symbolics in expression to their prime counterpart
+  // Pair of (does it contain secret, renamed expression)
+  std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
+
+  using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
+  // New: Get counterexample for secret-dependent branch, return true if success
+  bool getBranchCounterexample(Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
 
 public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,

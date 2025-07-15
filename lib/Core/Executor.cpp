@@ -1259,6 +1259,10 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   }
 
   state.addConstraint(condition);
+  // NEW: Duplicate constraint with secret symbolics replaced with primes
+  auto [hasSecret, renamedCond]{renameSecret(condition)};
+  if (hasSecret) state.addConstraint(renamedCond);
+
   if (ivcEnabled)
     doImpliedValueConcretization(state, condition, 
                                  ConstantExpr::alloc(1, Expr::Bool));
@@ -2224,9 +2228,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       assert(bi->getCondition() == bi->getOperand(0) &&
              "Wrong operand index!");
       ref<Expr> cond = eval(ki, 0, state).value;
-
       cond = optimizer.optimizeExpr(cond, false);
-      Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
       uint64_t branchId{stats::branchId.getValue()};
       ++stats::branchId;
@@ -2248,26 +2250,23 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // Only consider non-constant branch conditions
       bool skipLogging = isa<ConstantExpr>(cond);
 
+      Assignments assignments;
+      bool hasCounterexample{getBranchCounterexample(assignments, state, cond)};
+      // Record the branching state pairs if both directions are possible
+      if (hasCounterexample)
+      {
+        BothBranch b{branchId, instId, assignments};
+        state.bothBranches.push_back(b);
+      }
+
+      Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
+
       // NOTE: There is a hidden dependency here, markBranchVisited
       // requires that we still be in the context of the branch
       // instruction (it reuses its statistic id). Should be cleaned
       // up with convenient instruction specific data.
       if (statsTracker && state.stack.back().kf->trackCoverage)
         statsTracker->markBranchVisited(branches.first, branches.second);
-
-      // Record the branching state pairs if both directions are possible
-      if (branches.first && branches.second)
-      {
-        BothBranch::Assignments aTrue, aFalse;
-        bool sucTrue{this->getSymbolicSolution(*(branches.first), aTrue)};
-        bool sucFalse{this->getSymbolicSolution(*(branches.second), aFalse)};
-        if (sucTrue && sucFalse)
-        {
-          BothBranch b{branchId, instId, {aTrue, aFalse}};
-          (*branches.first).bothBranches.push_back(b);
-          (*branches.second).bothBranches.push_back(b);
-        }
-      }
 
       if (branches.first)
       {
@@ -4645,7 +4644,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
 void Executor::executeMakeSymbolic(ExecutionState &state, 
                                    const MemoryObject *mo,
-                                   const std::string &name) {
+                                   const std::string &name,
+                                   bool isSecret) {
   // Create a new object state for the memory object (instead of a copy).
   if (!replayKTest) {
     // Find a unique name for this array.  First try the original name,
@@ -4655,9 +4655,17 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     while (!state.arrayNames.insert(uniqueName).second) {
       uniqueName = name + "_" + llvm::utostr(++id);
     }
-    const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
+    const Array *array = arrayCache.CreateArray(uniqueName, mo->size, 0, 0, Expr::Int32, Expr::Int8, isSecret);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
+
+    if (array->isSecret)
+    {
+      prime[array->name] = {arrayCache.CreateArray(array->name + "__prime", array->size,
+                            array->constantValues.data(),
+                            array->constantValues.data() + array->constantValues.size(),
+                            array->domain, array->range, array->isSecret)};
+    }
     
     auto found = seedMap.find(&state);
     if (found != seedMap.end()) {
@@ -5101,6 +5109,102 @@ void Executor::dumpStates() {
   }
 
   ::dumpStates = 0;
+}
+
+std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
+{
+  if (dyn_cast<ConstantExpr>(e)) return {false, e};
+  if (auto re{dyn_cast<ReadExpr>(e)})
+  {
+    const Array *a{re->updates.root};
+    if (a->isSecret)
+    {
+      auto it = prime.find(a->name);
+      assert(it != prime.end() && "secret symbolic not found in prime map");
+      return {true, ReadExpr::create(UpdateList{it->second, re->updates.head}, re->index)};
+    }
+    else
+    {
+        return {false, e};
+    }
+  }
+
+  bool hasSecret{false};
+  std::vector<ref<Expr>> kids;
+  for (unsigned i{0}; i < e->getNumKids(); ++i)
+  {
+    auto [h, k]{renameSecret(e->getKid(i))};
+    hasSecret = (hasSecret || h);
+    kids.push_back(k);
+  }
+  return {hasSecret, e->rebuild(kids.data())};
+}
+
+bool Executor::getBranchCounterexample(Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
+{
+  auto [hasSecret, renamedCond]{renameSecret(cond)};
+  if (!hasSecret) return false;
+
+  ConstraintSet extendedConstraints{state.constraints};
+  ConstraintManager cm{extendedConstraints};
+
+  #define CHECK_ADD(COND) \
+    { \
+      Solver::Validity res; \
+      solver->setTimeout(coreSolverTimeout); \
+      bool success{solver->evaluate(extendedConstraints, COND, res, \
+                                    state.queryMetaData)}; \
+      solver->setTimeout(time::Span()); \
+      if (!success) \
+      { \
+        klee_warning("check condition validity failed"); \
+        ExprPPrinter::printQuery(llvm::errs(), extendedConstraints, \
+                                 ConstantExpr::alloc(0, Expr::Bool)); \
+        return false; \
+      } \
+      if (res == Solver::False) \
+      { \
+        return false; \
+      } \
+      else if (res == Solver::Unknown) \
+      { \
+        cm.addConstraint(COND); \
+      } \
+    }
+
+  CHECK_ADD(cond);
+  CHECK_ADD(NotExpr::create(renamedCond));
+
+  std::vector<const Array*> objects;
+  for (const auto &[_, a] : state.symbolics)
+  {
+    objects.push_back(a);
+    if (a->isSecret)
+    {
+      auto it = prime.find(a->name);
+      assert(it != prime.end() && "secret symbolic not found in prime map");
+      objects.push_back(it->second);
+    }
+  }
+
+  std::vector<std::vector<unsigned char>> values;
+  solver->setTimeout(coreSolverTimeout);
+  bool success{solver->getInitialValues(extendedConstraints, objects, values,
+                                        state.queryMetaData)};
+  solver->setTimeout(time::Span());
+  if (!success)
+  {
+    klee_warning("get initial values failed");
+    ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
+                              ConstantExpr::alloc(0, Expr::Bool));
+    return false;
+  }
+
+  for (unsigned i{0}; i < objects.size(); ++i)
+  {
+    assignments.push_back(std::make_pair(objects[i]->name, values[i]));
+  }
+  return true;
 }
 
 ///

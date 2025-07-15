@@ -649,10 +649,8 @@ void KleeHandler::writeBothBranches(const ExecutionState &state, unsigned id) {
   {
     if (visited.find(b.instId) != visited.end()) continue;
     visited.insert(b.instId);
-    writeTestCaseKTest(b.assignments.first, id,
-      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_true");
-    writeTestCaseKTest(b.assignments.second, id,
-      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId) + "_false");
+    writeTestCaseKTest(b.assignments, id,
+      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId));
   }
 }
 
@@ -947,6 +945,7 @@ static const char *modelledExternals[] = {
   "klee_get_obj_size",
   "klee_is_symbolic",
   "klee_make_symbolic",
+  "klee_make_symbolic_sc", // NEW
   "klee_mark_global",
   "klee_open_merge",
   "klee_close_merge",
