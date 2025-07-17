@@ -12,10 +12,14 @@
 
 #include "CallPathManager.h"
 #include "klee/System/Time.h"
+#include "klee/Support/BranchInfo.h"
+#include "klee/Support/json.hpp"
 
 #include <memory>
 #include <set>
 #include <sqlite3.h>
+
+using json = nlohmann::json;
 
 namespace llvm {
   class BranchInst;
@@ -54,6 +58,9 @@ namespace klee {
     CallPathManager callPathManager;
 
     bool updateMinDistToUncovered;
+
+    // NEW
+    std::map<unsigned, BranchInfo> visitedBranches;
 
   public:
     static bool useStatistics();
@@ -98,6 +105,9 @@ namespace klee {
     time::Span elapsed();
 
     void computeReachableUncovered();
+
+    // NEW
+    void visitBranch(const BranchInfo &b, bool canGoBoth);
   };
 
   uint64_t computeMinDistToUncovered(const KInstruction *ki,

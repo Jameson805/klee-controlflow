@@ -18,7 +18,6 @@
 #include "klee/Module/KModule.h"
 #include "klee/Support/Casting.h"
 #include "klee/Support/OptionCategories.h"
-#include "klee/Support/BranchDecision.h"
 
 #include "llvm/IR/Function.h"
 #include "llvm/Support/CommandLine.h"

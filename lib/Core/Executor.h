@@ -17,7 +17,6 @@
 
 #include "ExecutionState.h"
 #include "UserSearcher.h"
-#include "klee/Support/BranchDecision.h" // NEW
 
 #include "klee/ADT/RNG.h"
 #include "klee/Core/BranchTypes.h"

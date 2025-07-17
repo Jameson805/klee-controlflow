@@ -319,6 +319,31 @@ void StatsTracker::done() {
     if (istatsFile)
       writeIStats();
   }
+
+  std::unique_ptr<llvm::raw_fd_ostream> f{
+    executor.interpreterHandler->openOutputFile("visited_branches.json")};
+  if (!f)
+  {
+    klee_error("Unable to open visited_branches.json.");
+    return;
+  }
+
+  json j;
+  j["visited_branches"] = json::array();
+
+  for (const auto &[_, b] : visitedBranches) {
+    j["visited_branches"].push_back(json{
+    {"inst_id", b.instId},
+    {"filename", b.filename},
+    {"line", b.line},
+    {"col", b.col},
+    {"condition", b.condition},
+    {"count", b.count},
+    {"both_count", b.bothCount}
+    });
+  }
+
+  *f << j.dump(2); // pretty print with indent of 2 spaces
 }
 
 void StatsTracker::stepInstruction(ExecutionState &es) {
@@ -1062,4 +1087,11 @@ void StatsTracker::computeReachableUncovered() {
       currentFrameMinDist = computeMinDistToUncovered(kii, currentFrameMinDist);
     }
   }
+}
+
+void StatsTracker::visitBranch(const BranchInfo &b, bool canGoBoth)
+{
+  auto [it, _]{visitedBranches.insert({b.instId, b})};
+  ++it->second.count;
+  it->second.bothCount += canGoBoth;
 }

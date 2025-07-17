@@ -68,7 +68,6 @@ DISABLE_WARNING_POP
 // NEW needed for JSON function
 #include "klee/Support/json.hpp"
 using json = nlohmann::json;
-#include "klee/Support/BranchDecision.h"
 #include "../../lib/Core/ExecutionState.h" // This is bad practice
 
 using namespace llvm;
@@ -630,12 +629,8 @@ void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigne
 
   for (const auto &branchDecision : state.controlFlowTrace) {
     j["controlFlowTrace"].push_back(json{
-    {"branch_id", branchDecision.branchId},
     {"inst_id", branchDecision.instId},
-    {"filename", branchDecision.filename},
-    {"line", branchDecision.line},
-    {"col", branchDecision.col},
-    {"condition", branchDecision.condition},
+    {"branch_id", branchDecision.branchId},
     {"taken", branchDecision.taken}
     });
   }

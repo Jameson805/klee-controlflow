@@ -2255,9 +2255,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // Record the branching state pairs if both directions are possible
       if (hasCounterexample)
       {
-        BothBranch b{branchId, instId, assignments};
+        BothBranch b{instId, branchId, assignments};
         state.bothBranches.push_back(b);
       }
+
+      statsTracker->visitBranch({instId, filename, line, col, condStr}, hasCounterexample);
 
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
@@ -2272,7 +2274,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          (*branches.first).controlFlowTrace.push_back({branchId, instId, filename, line, col, condStr, true});
+          (*branches.first).controlFlowTrace.push_back({instId, branchId, true});
         }
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
       }
@@ -2280,7 +2282,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       {
         if (!skipLogging && !filename.empty())
         {
-          (*branches.second).controlFlowTrace.push_back({branchId, instId, filename, line, col, condStr, false});
+          (*branches.second).controlFlowTrace.push_back({instId, branchId, false});
         }
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       }
