@@ -32,7 +32,12 @@ with open(args.klee_output, "r") as f:
 df_klee = pd.DataFrame(data["visited_branches"])
 df_klee = df_klee[["filename", "line", "inst_id", "count", "both_count"]].rename(columns={"filename": "file"})
 
-df = pd.merge(df_ctchecker, df_klee, on=["file", "line"], how="left")
+df_joined = pd.merge(df_ctchecker, df_klee, on=["file", "line"], how="left")
+df_klee_filtered = df_klee[df_klee["both_count"] > 0]
+df_klee_only = df_klee_filtered.merge(df_ctchecker, on=["file", "line"], how="left", indicator=True)
+df_klee_only = df_klee_only[df_klee_only["_merge"] == "left_only"].drop(columns="_merge")
+df = pd.concat([df_joined, df_klee_only], ignore_index=True, sort=False)
+
 df["inst_id"] = df["inst_id"].astype("Int64")
 df["count"] = df["count"].fillna(0).astype("int64")
 df["both_count"] = df["both_count"].fillna(0).astype("int64")
@@ -41,14 +46,18 @@ df = df.sort_values(
     ascending=[False, True, True, True]
 ).reset_index()
 
+df["code"] = df["code"].fillna("")
+
 def highlight_row(row):
-    if row["both_count"] > 0:
-        return ['background-color: lightgreen'] * len(row)
+    if row["code"] == "":
+        return ["background-color: lightsalmon"] * len(row)
+    elif row["both_count"] > 0:
+        return ["background-color: lightgreen"] * len(row)
     elif row["count"] == 0:
-        return ['background-color: lightcoral'] * len(row)
+        return ["background-color: lightcoral"] * len(row)
     else:
-        return [''] * len(row)
+        return [""] * len(row)
 
 styled = df.style.apply(highlight_row, axis=1)
 
-styled.to_html(args.report_path, escape=False)
+styled.to_html(args.report_path, escape=False, na_rep="")
