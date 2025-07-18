@@ -23,3 +23,12 @@ Test cases for secret-dependent branches are generated as `test#_inst_<instructi
 - Secret variables are tracked in the `Array` class
 - When adding a constraint in `Executor`, it is added with both the original secret variables and the secret variables replaced with their "prime" counterparts.
 - When encountering a branch the current constraint set is augmented by `condition` and `not(condition')`, where `condition'` is `condition` with the secret variables replaced by their "prime" counterparts.
+
+# Generate Comparison with CtChecker
+
+Install Python packages `pandas` and `jinja2`.
+
+Run
+```bash
+scripts/compare_with_ctchecker.py <result_with_sources.txt> <visited_branches.json> <output.html>
+```
