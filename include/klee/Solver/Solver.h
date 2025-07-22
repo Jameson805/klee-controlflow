@@ -13,6 +13,7 @@
 #include "klee/Expr/Expr.h"
 #include "klee/System/Time.h"
 #include "klee/Solver/SolverCmdLine.h"
+#include "klee/Expr/ExprPPrinter.h"
 
 #include <memory>
 #include <string>

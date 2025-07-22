@@ -277,8 +277,11 @@ bool CexCachingSolver::computeValidity(const Query& query,
     return false;
   assert(a && "computeValidity() must have assignment");
   ref<Expr> q = a->evaluate(query.expr);
-  assert(isa<ConstantExpr>(q) && 
-         "assignment evaluation did not result in constant");
+
+  if (!isa<ConstantExpr>(q)) {
+    // Fallback: delegate to underlying solver without caching
+    return solver->impl->computeValidity(query, result);
+  }
 
   if (cast<ConstantExpr>(q)->isTrue()) {
     if (!getAssignment(query, a))

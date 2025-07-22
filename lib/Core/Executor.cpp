@@ -1093,7 +1093,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
         if (!resolveSuc)
         {
           current.pc = current.prevPC;
-          // ExprPPrinter::printQuery(llvm::errs(), current.constraints,
+          // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
           //                         ConstantExpr::alloc(0, Expr::Bool));
           terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
           return StatePair(nullptr, nullptr);
@@ -1103,7 +1103,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     else
     {
       current.pc = current.prevPC;
-      // ExprPPrinter::printQuery(llvm::errs(), current.constraints,
+      // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
       //                         ConstantExpr::alloc(0, Expr::Bool));
       terminateStateOnSolverError(current, "Failed to concretize fork");
       return StatePair(nullptr, nullptr);
