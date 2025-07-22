@@ -1053,10 +1053,61 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   bool success = solver->evaluate(current.constraints, condition, res,
                                   current.queryMetaData);
   solver->setTimeout(time::Span());
+
+  ConstraintSet constraintSet{current.constraints};
+
   if (!success) {
-    current.pc = current.prevPC;
-    terminateStateOnSolverError(current, "Query timed out (fork).");
-    return StatePair(nullptr, nullptr);
+    klee_warning("Query timed out (fork).");
+    constraintSet = {};
+    ConstraintManager cm{constraintSet};
+
+    std::vector<const Array*> objects;
+    for (unsigned i = 0; i != current.symbolics.size(); ++i)
+      objects.push_back(current.symbolics[i].second);
+    std::vector<std::vector<unsigned char>> values;
+
+    solver->setTimeout(timeout);
+    bool concretizeSuc{solver->getInitialValues(current.constraints, objects, values, current.queryMetaData)};
+    solver->setTimeout(time::Span());
+
+    if (concretizeSuc)
+    {
+      for (unsigned i{0}; i < current.symbolics.size(); ++i)
+      {
+        for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
+        {
+          cm.addConstraint(
+              EqExpr::alloc(
+                ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
+                  ConstantExpr::alloc(j, current.symbolics[i].second->domain)
+                ),
+                ConstantExpr::alloc(values[i][j], Expr::Int8)
+              )
+          );
+        }
+
+        solver->setTimeout(timeout);
+        bool resolveSuc{solver->evaluate(constraintSet, condition, res,
+                                        current.queryMetaData)};
+        solver->setTimeout(time::Span());
+        if (!resolveSuc)
+        {
+          current.pc = current.prevPC;
+          // ExprPPrinter::printQuery(llvm::errs(), current.constraints,
+          //                         ConstantExpr::alloc(0, Expr::Bool));
+          terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
+          return StatePair(nullptr, nullptr);
+        }
+      }
+    }
+    else
+    {
+      current.pc = current.prevPC;
+      // ExprPPrinter::printQuery(llvm::errs(), current.constraints,
+      //                         ConstantExpr::alloc(0, Expr::Bool));
+      terminateStateOnSolverError(current, "Failed to concretize fork");
+      return StatePair(nullptr, nullptr);
+    }
   }
 
   if (!isSeeding) {
@@ -1215,7 +1266,9 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
+    trueState->constraints = constraintSet;
     addConstraint(*trueState, condition);
+    falseState->constraints = constraintSet;
     addConstraint(*falseState, Expr::createIsZero(condition));
 
     // Kinda gross, do we even really still want this option?
