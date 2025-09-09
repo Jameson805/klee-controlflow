@@ -2312,7 +2312,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         state.bothBranches.push_back(b);
       }
 
-      statsTracker->visitBranch({instId, filename, line, col, condStr}, hasCounterexample);
+      statsTracker->visitBranch(
+        wallTimer.delta().toSeconds(),
+        {instId, filename, line, col, condStr},
+        hasCounterexample
+      );
 
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
@@ -3696,7 +3700,7 @@ void Executor::doDumpStates() {
     return;
   }
 
-  klee_message("halting execution, dumping remaining states");
+  klee_message("halting execution after %lf s, dumping remaining states", wallTimer.delta().toSeconds());
   for (const auto &state : states)
     terminateStateEarly(*state, "Execution halting.", StateTerminationType::Interrupted);
   updateStates(nullptr);
@@ -3707,6 +3711,7 @@ void Executor::run(ExecutionState &initialState) {
 
   // Delay init till now so that ticks don't accrue during optimization and such.
   timers.reset();
+  wallTimer.reset();
 
   states.insert(&initialState);
 

@@ -19,6 +19,10 @@ using namespace klee;
 
 WallTimer::WallTimer() : start{time::getWallTime()} {}
 
+void WallTimer::reset() {
+  start = time::getWallTime();
+}
+
 time::Span WallTimer::delta() const {
   return {time::getWallTime() - start};
 }

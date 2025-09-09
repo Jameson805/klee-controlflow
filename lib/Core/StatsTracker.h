@@ -107,7 +107,7 @@ namespace klee {
     void computeReachableUncovered();
 
     // NEW
-    void visitBranch(const BranchInfo &b, bool canGoBoth);
+    void visitBranch(double time, const BranchInfo &b, bool canGoBoth);
   };
 
   uint64_t computeMinDistToUncovered(const KInstruction *ki,

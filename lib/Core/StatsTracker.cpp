@@ -1089,9 +1089,20 @@ void StatsTracker::computeReachableUncovered() {
   }
 }
 
-void StatsTracker::visitBranch(const BranchInfo &b, bool canGoBoth)
+void StatsTracker::visitBranch(double time, const BranchInfo &b, bool canGoBoth)
 {
   auto [it, _]{visitedBranches.insert({b.instId, b})};
+
+  // Record the branch either if it's the first time we see it or if a counterexample is found for the first time
+  if (it->second.count == 0)
+  {
+    klee_message_to_file("[BRANCH] %lf : %u : %s : %u : %u", time, b.instId, b.filename.c_str(), b.line, b.col);
+  }
+  if (it->second.bothCount == 0 && canGoBoth)
+  {
+    klee_message("[NON-CT BRANCH] %lf : %u : %s : %u : %u", time, b.instId, b.filename.c_str(), b.line, b.col);
+  }
+
   ++it->second.count;
   it->second.bothCount += canGoBoth;
 }

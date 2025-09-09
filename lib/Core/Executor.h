@@ -116,6 +116,7 @@ private:
   TreeStreamWriter *pathWriter, *symPathWriter;
   SpecialFunctionHandler *specialFunctionHandler;
   TimerGroup timers;
+  WallTimer wallTimer;
   std::unique_ptr<ExecutionTree> executionTree;
 
   /// Used to track states that have been added during the current
