@@ -6,6 +6,8 @@ Currently, only `Br` instruction records branch decisions. TODO: `IndirectBr` (l
 
 `BothBranch`: For each execution path, for each branch along the execution path where either sides could be taken, output the pairs of inputs such that the execution would diverge at this branch.
 
+When visiting a branch for the first time, a message will be sent to `messages.txt`. When finding a counterexample for a branch for the first time, a message will be sent to both the console and `messages.txt`.
+
 # Use Product Program for Branches
 
 ## Usage
@@ -30,5 +32,8 @@ Install Python packages `pandas` and `jinja2`.
 
 Run
 ```bash
-scripts/compare_with_ctchecker.py <result_with_sources.txt> <visited_branches.json> <output.html>
+scripts/compare_with_ctchecker.py <ctchecker_result.json> <klee-out-n> <report.html> <plot.png> <name_on_plot_title> --ctchecker-prefix <ctchecker_prefix> --code-path <code_path>
 ```
+
+- `<ctchecker_prefix>`: For mbedtls, CtChecker is run inside the `library` folder of the the source directory. Therefore, you should set this to `library` so that `bignum.c` is correctly mapped to `library/bignum.c`.
+- `<code_path>`: The path to the source directory that you ran KLEE on. The lines of code will be extracted from `<code_path>/<filename>` where `<filename>` is from `visited_branches.json`.
