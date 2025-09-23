@@ -127,6 +127,10 @@ void klee_make_symbolic(void *array, size_t nbytes, const char *name) {
   }
 }
 
+void klee_make_symbolic_sc(void *array, size_t nbytes, const char *name, int is_secret) {
+  klee_make_symbolic(array, nbytes, name);
+}
+
 void klee_silent_exit(int x) { exit(x); }
 
 uintptr_t klee_choose(uintptr_t n) {
