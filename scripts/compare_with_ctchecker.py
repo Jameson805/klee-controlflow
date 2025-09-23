@@ -16,6 +16,7 @@ parser.add_argument("plot_path", help="Path to save the output plot image")
 parser.add_argument("program_name", help="Name of the program analyzed")
 parser.add_argument("--ctchecker-prefix", default="", help="Prefix to the filenames in the CtChecker output (defaults to empty string)")
 parser.add_argument("--code-path", default="", help="Path to the source code for the filenames in the KLEE output (defaults to empty string)")
+parser.add_argument("--lines", default="", help="Line number range to filter (e.g., 100:200)")
 args = parser.parse_args()
 
 def load_ctchecker(path, prefix):
@@ -114,11 +115,18 @@ def load_messages(path):
 df_time = load_messages(os.path.join(args.klee_output, "messages.txt"))
 df = pd.merge(df, df_time, on="inst_id", how="left")
 
+if args.lines:
+    line_range = args.lines.split(":")
+    assert len(line_range) == 2, "Lines argument must be in the format start:end"
+    start = int(line_range[0])
+    end = int(line_range[1])
+    df = df[(df["line"] >= start) & (df["line"] <= end)]
+
 def make_report(df_in, path):
     df = df_in.copy()
     df = df.sort_values(
-        by=["both_count", "count", "filename", "line", "column"],
-        ascending=[False, True, True, True, True]
+        by=["both_count", "filename", "line", "column"],
+        ascending=[False, True, True, True]
     ).reset_index(drop=True)
     in_ctchecker_series = df["in_ctchecker"]
     df_to_report = df.drop(columns=["in_ctchecker"])

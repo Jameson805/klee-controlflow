@@ -32,7 +32,7 @@ Install Python packages `pandas` and `jinja2`.
 
 Run
 ```bash
-scripts/compare_with_ctchecker.py <ctchecker_result.json> <klee-out-n> <report.html> <plot.png> <name_on_plot_title> --ctchecker-prefix <ctchecker_prefix> --code-path <code_path>
+scripts/compare_with_ctchecker.py <ctchecker_result.json> <klee-out-n> <report.html> <plot.png> <name_on_plot_title> --ctchecker-prefix <ctchecker_prefix> --code-path <code_path> --lines <line_range_begin>:<line_range_end_inclusive>
 ```
 
 - `<ctchecker_prefix>`: For mbedtls, CtChecker is run inside the `library` folder of the the source directory. Therefore, you should set this to `library` so that `bignum.c` is correctly mapped to `library/bignum.c`.
