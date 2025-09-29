@@ -2283,40 +2283,46 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> cond = eval(ki, 0, state).value;
       cond = optimizer.optimizeExpr(cond, false);
 
-      uint64_t branchId{stats::branchId.getValue()};
-      ++stats::branchId;
-      unsigned instId{ki->info->id};
-      // Get branch location in source code
-      std::string filename;
-      unsigned line = 0;
-      unsigned col = 0;
-      std::string condStr;
-      if (i->getDebugLoc()) {
-        auto loc = i->getDebugLoc();
-        filename = loc->getFilename().str();
-        line = loc.getLine();
-        col = loc.getCol();
-        llvm::raw_string_ostream rso(condStr);
-        cond->print(rso);
-        rso.flush();
-      }
-      // Only consider non-constant branch conditions
-      bool skipLogging = isa<ConstantExpr>(cond);
+      // Check CT: only consider non-constant branch conditions
+      if (!isa<ConstantExpr>(cond)) {
+        double time{wallTimer.delta().toSeconds()};
+        unsigned instId{ki->info->id};
+        // Get branch location in source code
+        std::string filename;
+        unsigned line{0}, col{0};
+        std::string condStr;
+        if (i->getDebugLoc()) {
+          DebugLoc loc = i->getDebugLoc();
+          filename = loc->getFilename().str();
+          line = loc.getLine();
+          col = loc.getCol();
 
-      Assignments assignments;
-      bool hasCounterexample{getBranchCounterexample(assignments, state, cond)};
-      // Record the branching state pairs if both directions are possible
-      if (hasCounterexample)
-      {
-        BothBranch b{instId, branchId, assignments};
-        state.bothBranches.push_back(b);
-      }
+          llvm::raw_string_ostream rso(condStr);
+          cond->print(rso);
+          rso.flush();
+        }
 
-      statsTracker->visitBranch(
-        wallTimer.delta().toSeconds(),
-        {instId, filename, line, col, condStr},
-        hasCounterexample
-      );
+        Assignments assignments;
+        bool nonCt{getBranchCounterexample(assignments, state, cond)};
+
+        if (nonCt) {
+          // Print to console and write test case if first counterexample
+          if (statsTracker->visitNonCtBranch(instId)) {
+            klee_message("[NON-CT BRANCH] %lf : %u : %s : %u : %u", time, instId, filename.c_str(), line, col);
+            writeTestCaseKTest(assignments, "branch_counterexample_" + std::to_string(instId) + ".ktest");
+          }
+        }
+
+        json j;
+        j["time"] = time;
+        j["inst_id"] = instId;
+        j["filename"] = filename;
+        j["line"] = line;
+        j["col"] = col;
+        j["condition"] = condStr;
+        j["non_ct"] = nonCt;
+        klee_message_to_file("[BRANCH] %s",  j.dump().c_str());
+      }
 
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
@@ -2327,20 +2333,10 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (statsTracker && state.stack.back().kf->trackCoverage)
         statsTracker->markBranchVisited(branches.first, branches.second);
 
-      if (branches.first)
-      {
-        if (!skipLogging && !filename.empty())
-        {
-          (*branches.first).controlFlowTrace.push_back({instId, branchId, true});
-        }
+      if (branches.first) {
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
       }
-      if (branches.second)
-      {
-        if (!skipLogging && !filename.empty())
-        {
-          (*branches.second).controlFlowTrace.push_back({instId, branchId, false});
-        }
+      if (branches.second) {
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       }
     }
@@ -5265,6 +5261,38 @@ bool Executor::getBranchCounterexample(Assignments &assignments, const Execution
     assignments.push_back(std::make_pair(objects[i]->name, values[i]));
   }
   return true;
+}
+
+// XXX: Adopted from main.cpp
+bool Executor::writeTestCaseKTest(const Assignments &out, const std::string &testName) {
+  llvm::SmallString<128> path(outputDir);
+  llvm::sys::path::append(path, testName);
+  klee_message("Writing KTest file: %s", path.c_str());
+  KTest b;
+  b.numArgs = 0;
+  b.args = nullptr;
+  b.symArgvs = 0;
+  b.symArgvLen = 0;
+  b.numObjects = out.size();
+  b.objects = new KTestObject[b.numObjects];
+  assert(b.objects);
+  for (unsigned i = 0; i < b.numObjects; i++) {
+    KTestObject *o = &b.objects[i];
+    o->name = const_cast<char *>(out[i].first.c_str());
+    o->numBytes = out[i].second.size();
+    o->bytes = new unsigned char[o->numBytes];
+    assert(o->bytes);
+    std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+  }
+  bool status = true;
+  if (!kTest_toFile(&b, path.c_str())) {
+    status = false;
+    klee_warning("unable to write output test case, losing it");
+  }
+  for (unsigned i = 0; i < b.numObjects; i++)
+    delete[] b.objects[i].bytes;
+  delete[] b.objects;
+  return status;
 }
 
 ///

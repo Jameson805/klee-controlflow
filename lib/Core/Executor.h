@@ -29,6 +29,9 @@
 #include "klee/Module/KModule.h"
 #include "klee/System/Time.h"
 
+#include "klee/Support/json.hpp"
+using json = nlohmann::json;
+
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -212,6 +215,9 @@ private:
 
   /// Typeids used during exception handling
   std::vector<ref<Expr>> eh_typeids;
+
+  // Directory to write output files, e.g., test cases of non-CT branches
+  llvm::SmallString<128> outputDir;
 
   /// Return the typeid corresponding to a certain `type_info`
   ref<ConstantExpr> getEhTypeidFor(ref<Expr> type_info);
@@ -525,6 +531,7 @@ private:
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
   // New: Get counterexample for secret-dependent branch, return true if success
   bool getBranchCounterexample(Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
+  bool writeTestCaseKTest(const Assignments &out, const std::string &testName);
 
 public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,
@@ -598,6 +605,9 @@ public:
 
   MergingSearcher *getMergingSearcher() const { return mergingSearcher; };
   void setMergingSearcher(MergingSearcher *ms) { mergingSearcher = ms; };
+
+  // Set output directory for test cases
+  void setOutputDir(const llvm::SmallString<128> &outputDir) override { this->outputDir = outputDir; };
 };
 
 } // namespace klee

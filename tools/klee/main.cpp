@@ -380,11 +380,6 @@ public:
   std::string getTestFilename(const std::string &suffix, unsigned id, const std::string &presuffix = "");
   std::unique_ptr<llvm::raw_fd_ostream> openTestFile(const std::string &suffix, unsigned id);
   
-  //NEW writes control flow information to JSON file
-  void writeControlFlowTraceJSON(const ExecutionState &state, unsigned id);
-  //NEW writes inputs for branches that can go both ways
-  void writeBothBranches(const ExecutionState &state, unsigned id);
-
   // load a .path file
   static void loadPathFile(std::string name,
                            std::vector<bool> &buffer);
@@ -480,6 +475,8 @@ KleeHandler::~KleeHandler() {
 
 void KleeHandler::setInterpreter(Interpreter *i) {
   m_interpreter = i;
+
+  m_interpreter->setOutputDir(m_outputDirectory);
 
   if (WritePaths) {
     m_pathWriter = new TreeStreamWriter(getOutputFilename("paths.ts"));
@@ -618,37 +615,6 @@ void KleeHandler::writeTestCaseXML(
   *file << "</testcase>\n";
 }
 
-// NEW writes control flow information to JSON file, next to ktest file
-void KleeHandler::writeControlFlowTraceJSON(const ExecutionState &state, unsigned id) {
-  auto f = openTestFile("json", id);
-  if (!f)
-    return;
-
-  nlohmann::json j;
-  j["controlFlowTrace"] = nlohmann::json::array();
-
-  for (const auto &branchDecision : state.controlFlowTrace) {
-    j["controlFlowTrace"].push_back(json{
-    {"inst_id", branchDecision.instId},
-    {"branch_id", branchDecision.branchId},
-    {"taken", branchDecision.taken}
-    });
-  }
-
-  *f << j.dump(2); // pretty print with indent of 2 spaces
-}
-
-void KleeHandler::writeBothBranches(const ExecutionState &state, unsigned id) {
-  static std::set<uint64_t> visited;
-  for (const BothBranch &b : state.bothBranches)
-  {
-    if (visited.find(b.instId) != visited.end()) continue;
-    visited.insert(b.instId);
-    writeTestCaseKTest(b.assignments, id,
-      "_inst_" + std::to_string(b.instId) + "_br_" + std::to_string(b.branchId));
-  }
-}
-
 /* Outputs all files (.ktest, .kquery, .cov etc.) describing a test case */
 void KleeHandler::processTestCase(const ExecutionState &state,
                                   const char *errorMessage,
@@ -669,11 +635,6 @@ void KleeHandler::processTestCase(const ExecutionState &state,
         if (writeTestCaseKTest(assignments, test_id)) {
           atLeastOneGenerated = true;
         }
-
-        //NEW call to JSON file creation function
-        writeControlFlowTraceJSON(state, test_id);
-        //NEW call to write inputs for branches that can go both ways
-        writeBothBranches(state, test_id);
       }
 
       if (WriteXMLTests) {

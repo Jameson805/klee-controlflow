@@ -9,6 +9,8 @@
 #ifndef KLEE_INTERPRETER_H
 #define KLEE_INTERPRETER_H
 
+#include "llvm/ADT/SmallString.h"
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -164,6 +166,9 @@ public:
 
   virtual void getCoveredLines(const ExecutionState &state,
                                std::map<const std::string*, std::set<unsigned> > &res) = 0;
+
+  // Set output directory for test cases
+  virtual void setOutputDir(const llvm::SmallString<128> &outputDir) = 0;
 };
 
 } // End klee namespace

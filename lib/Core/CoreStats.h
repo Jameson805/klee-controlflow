@@ -51,9 +51,6 @@ namespace stats {
   /// distance to a function return.
   extern Statistic minDistToReturn;
 
-  // NEW: ID of the last branch visit (each visit to the same branch gets different ID)
-  extern Statistic branchId;
-
   /// Count branch types in execution tree. Inhibited branches are ignored.
   #undef BTYPE
   #define BTYPE(Name,I) extern Statistic branches ## Name;

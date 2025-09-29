@@ -12,7 +12,6 @@
 
 #include "CallPathManager.h"
 #include "klee/System/Time.h"
-#include "klee/Support/BranchInfo.h"
 #include "klee/Support/json.hpp"
 
 #include <memory>
@@ -59,8 +58,8 @@ namespace klee {
 
     bool updateMinDistToUncovered;
 
-    // NEW
-    std::map<unsigned, BranchInfo> visitedBranches;
+    // Instruction ID of non-CT branches
+    std::set<unsigned> nonCtBranches;
 
   public:
     static bool useStatistics();
@@ -106,8 +105,8 @@ namespace klee {
 
     void computeReachableUncovered();
 
-    // NEW
-    void visitBranch(double time, const BranchInfo &b, bool canGoBoth);
+    // Mark non-CT branch as visited and return if there was no counterexample before
+    bool visitNonCtBranch(unsigned instId);
   };
 
   uint64_t computeMinDistToUncovered(const KInstruction *ki,

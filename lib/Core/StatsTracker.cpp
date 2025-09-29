@@ -319,31 +319,6 @@ void StatsTracker::done() {
     if (istatsFile)
       writeIStats();
   }
-
-  std::unique_ptr<llvm::raw_fd_ostream> f{
-    executor.interpreterHandler->openOutputFile("visited_branches.json")};
-  if (!f)
-  {
-    klee_error("Unable to open visited_branches.json.");
-    return;
-  }
-
-  json j;
-  j["visited_branches"] = json::array();
-
-  for (const auto &[_, b] : visitedBranches) {
-    j["visited_branches"].push_back(json{
-    {"inst_id", b.instId},
-    {"filename", b.filename},
-    {"line", b.line},
-    {"col", b.col},
-    {"condition", b.condition},
-    {"count", b.count},
-    {"both_count", b.bothCount}
-    });
-  }
-
-  *f << j.dump(2); // pretty print with indent of 2 spaces
 }
 
 void StatsTracker::stepInstruction(ExecutionState &es) {
@@ -1089,20 +1064,13 @@ void StatsTracker::computeReachableUncovered() {
   }
 }
 
-void StatsTracker::visitBranch(double time, const BranchInfo &b, bool canGoBoth)
+bool StatsTracker::visitNonCtBranch(unsigned instId)
 {
-  auto [it, _]{visitedBranches.insert({b.instId, b})};
-
-  // Record the branch either if it's the first time we see it or if a counterexample is found for the first time
-  if (it->second.count == 0)
-  {
-    klee_message_to_file("[BRANCH] %lf : %u : %s : %u : %u", time, b.instId, b.filename.c_str(), b.line, b.col);
+  if (nonCtBranches.find(instId) == nonCtBranches.end()) {
+    nonCtBranches.insert(instId);
+    return true;
   }
-  if (it->second.bothCount == 0 && canGoBoth)
-  {
-    klee_message("[NON-CT BRANCH] %lf : %u : %s : %u : %u", time, b.instId, b.filename.c_str(), b.line, b.col);
+  else {
+    return false;
   }
-
-  ++it->second.count;
-  it->second.bothCount += canGoBoth;
 }
