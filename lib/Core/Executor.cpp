@@ -2321,6 +2321,27 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         j["col"] = col;
         j["condition"] = condStr;
         j["non_ct"] = nonCt;
+
+        json j_constraints = json::array();
+        std::size_t i{0};
+        assert(
+          state.constraints.size() == state.constraints.getInsts().size()
+          && "each constraint should correspond to an instruction id"
+        );
+        for (const ref<Expr> &c : state.constraints) {
+          json item;
+          item["inst_id"] = state.constraints.getInsts()[i++];
+
+          std::string cstr;
+          llvm::raw_string_ostream rso(cstr);
+          c->print(rso);
+          rso.flush();
+          item["constraint"] = cstr;
+
+          j_constraints.push_back(item);
+        }
+        j["constraints"] = std::move(j_constraints);
+
         klee_message_to_file("[BRANCH] %s",  j.dump().c_str());
       }
 

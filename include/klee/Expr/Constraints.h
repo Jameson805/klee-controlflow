@@ -12,6 +12,8 @@
 
 #include "klee/Expr/Expr.h"
 
+#include <optional>
+
 namespace klee {
 
 /// Resembles a set of constraints that can be passed around
@@ -31,17 +33,24 @@ public:
   constraint_iterator end() const;
   size_t size() const noexcept;
 
-  explicit ConstraintSet(constraints_ty cs) : constraints(std::move(cs)) {}
+  explicit ConstraintSet(constraints_ty cs, std::vector<std::optional<unsigned>> insts) : constraints(std::move(cs)), constraintInsts(std::move(insts)) {}
+  explicit ConstraintSet(constraints_ty cs) : constraints(std::move(cs)), constraintInsts(std::vector<std::optional<unsigned>>(cs.size(), std::nullopt)) {}
   ConstraintSet() = default;
 
-  void push_back(const ref<Expr> &e);
+  void push_back(const ref<Expr> &e, std::optional<unsigned> inst = std::nullopt);
 
   bool operator==(const ConstraintSet &b) const {
     return constraints == b.constraints;
   }
 
+  const std::vector<std::optional<unsigned>>& getInsts() const {
+    return constraintInsts;
+  }
+
 private:
   constraints_ty constraints;
+  // Instructions that added the constraints
+  std::vector<std::optional<unsigned>> constraintInsts;
 };
 
 class ExprVisitor;
@@ -62,7 +71,7 @@ public:
 
   /// Add constraint to the referenced constraint set
   /// \param constraint
-  void addConstraint(const ref<Expr> &constraint);
+  void addConstraint(const ref<Expr> &constraint, std::optional<unsigned> inst = std::nullopt);
 
 private:
   /// Rewrite set of constraints using the visitor
@@ -71,7 +80,7 @@ private:
   bool rewriteConstraints(ExprVisitor &visitor);
 
   /// Add constraint to the set of constraints
-  void addConstraintInternal(const ref<Expr> &constraint);
+  void addConstraintInternal(const ref<Expr> &constraint, std::optional<unsigned> inst);
 
   ConstraintSet &constraints;
 };

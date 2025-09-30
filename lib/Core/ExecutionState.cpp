@@ -390,7 +390,7 @@ void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
 
 void ExecutionState::addConstraint(ref<Expr> e) {
   ConstraintManager c(constraints);
-  c.addConstraint(e);
+  c.addConstraint(e, prevPC->info->id);
 }
 
 void ExecutionState::addCexPreference(const ref<Expr> &cond) {

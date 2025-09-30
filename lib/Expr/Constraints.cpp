@@ -75,14 +75,15 @@ bool ConstraintManager::rewriteConstraints(ExprVisitor &visitor) {
   bool changed = false;
 
   std::swap(constraints, old);
+  std::size_t i{0};
   for (auto &ce : old) {
     ref<Expr> e = visitor.visit(ce);
 
     if (e!=ce) {
-      addConstraintInternal(e); // enable further reductions
+      addConstraintInternal(e, old.getInsts()[i++]); // enable further reductions
       changed = true;
     } else {
-      constraints.push_back(ce);
+      constraints.push_back(ce, old.getInsts()[i++]);
     }
   }
 
@@ -115,7 +116,7 @@ ref<Expr> ConstraintManager::simplifyExpr(const ConstraintSet &constraints,
   return ExprReplaceVisitor2(equalities).visit(e);
 }
 
-void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
+void ConstraintManager::addConstraintInternal(const ref<Expr> &e, std::optional<unsigned> inst) {
   // rewrite any known equalities and split Ands into different conjuncts
 
   switch (e->getKind()) {
@@ -127,8 +128,8 @@ void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
     // split to enable finer grained independence and other optimizations
   case Expr::And: {
     BinaryExpr *be = cast<BinaryExpr>(e);
-    addConstraintInternal(be->left);
-    addConstraintInternal(be->right);
+    addConstraintInternal(be->left, inst);
+    addConstraintInternal(be->right, inst);
     break;
   }
 
@@ -145,19 +146,19 @@ void ConstraintManager::addConstraintInternal(const ref<Expr> &e) {
 	rewriteConstraints(visitor);
       }
     }
-    constraints.push_back(e);
+    constraints.push_back(e, inst);
     break;
   }
 
   default:
-    constraints.push_back(e);
+    constraints.push_back(e, inst);
     break;
   }
 }
 
-void ConstraintManager::addConstraint(const ref<Expr> &e) {
+void ConstraintManager::addConstraint(const ref<Expr> &e, std::optional<unsigned> inst) {
   ref<Expr> simplified = simplifyExpr(constraints, e);
-  addConstraintInternal(simplified);
+  addConstraintInternal(simplified, inst);
 }
 
 ConstraintManager::ConstraintManager(ConstraintSet &_constraints)
@@ -175,4 +176,7 @@ klee::ConstraintSet::constraint_iterator ConstraintSet::end() const {
 
 size_t ConstraintSet::size() const noexcept { return constraints.size(); }
 
-void ConstraintSet::push_back(const ref<Expr> &e) { constraints.push_back(e); }
+void ConstraintSet::push_back(const ref<Expr> &e, std::optional<unsigned> inst) {
+  constraints.push_back(e);
+  constraintInsts.push_back(inst);
+}
