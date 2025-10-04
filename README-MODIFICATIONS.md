@@ -28,12 +28,39 @@ Test cases for secret-dependent branches are generated as `test#_inst_<instructi
 
 # Generate Comparison with CtChecker
 
-Install Python packages `pandas` and `jinja2`.
+The comparison and reporting flow is split into three scripts:
 
-Run
+- `scripts/compare_with_ctchecker.py`: reads CtChecker output and KLEE output directory, joins and aggregates results, and writes a combined dataframe to a JSON file (records orient).
+- `scripts/make_report.py`: reads the combined JSON and produces an HTML report.
+- `scripts/make_plot.py`: reads the combined JSON and produces the time-vulnerabilities plot.
+
+Install the Python packages required by the scripts (at minimum): `pandas`, `matplotlib`, and `numpy`.
+
+Example usage:
+
+1) Produce the combined JSON (replace arguments as appropriate):
+
 ```bash
-scripts/compare_with_ctchecker.py <ctchecker_result.json> <klee-out-n> <report.html> <plot.png> <name_on_plot_title> --ctchecker-prefix <ctchecker_prefix> --code-path <code_path> --lines <line_range_begin>:<line_range_end_inclusive>
+scripts/compare_with_ctchecker.py <ctchecker_result.json> <klee-out-n> <output.json>
+	--ctchecker-prefix <ctchecker_prefix> --code-path <code_path> --lines <line_range_begin>:<line_range_end_inclusive>
 ```
 
-- `<ctchecker_prefix>`: For mbedtls, CtChecker is run inside the `library` folder of the the source directory. Therefore, you should set this to `library` so that `bignum.c` is correctly mapped to `library/bignum.c`.
-- `<code_path>`: The path to the source directory that you ran KLEE on. The lines of code will be extracted from `<code_path>/<filename>` where `<filename>` is from `visited_branches.json`.
+2) Generate the HTML report from the JSON:
+
+```bash
+scripts/make_report.py <output.json> <report.html>
+```
+
+3) Generate the time-vulnerabilities plot from the JSON:
+
+```bash
+scripts/make_plot.py <output.json> <name_on_plot_title> <plot.png>
+```
+
+Notes:
+
+- `<ctchecker_prefix>`: For mbedtls, CtChecker is run inside the `library` folder of the source directory. Setting this to `library` will map filenames (for example `bignum.c`) to `library/bignum.c` so they match KLEE's output paths.
+- `<code_path>`: the path to the source directory you ran KLEE on. When provided, the compare script will extract source lines from `<code_path>/<filename>` to include in the combined dataframe.
+- `--lines start:end`: optional filter to only include entries whose line number falls in the inclusive range `start:end`.
+
+The `compare_with_ctchecker.py` script writes the combined dataframe in JSON (records orient). This JSON is the single input to both `make_report.py` and `make_plot.py`.

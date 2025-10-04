@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import os
-import re
 import json
 
-parser = argparse.ArgumentParser(description="Join CtChecker and KLEE output and generate an HTML report.")
+parser = argparse.ArgumentParser(description="Join CtChecker and KLEE output and save combined data to JSON.")
 parser.add_argument("ctchecker_output", help="Path to CtChecker output file (results_with_source-WL-FS-SRC-1.txt)")
 parser.add_argument("klee_output", help="Path to KLEE output directory")
-parser.add_argument("report_path", help="Path to save the output HTML report")
-parser.add_argument("plot_path", help="Path to save the output plot image")
-parser.add_argument("program_name", help="Name of the program analyzed")
+parser.add_argument("output_path", help="Path to save the combined dataframe in JSON format")
 parser.add_argument("--ctchecker-prefix", default="", help="Prefix to the filenames in the CtChecker output (defaults to empty string)")
 parser.add_argument("--code-path", default="", help="Path to the source code for the filenames in the KLEE output (defaults to empty string)")
 parser.add_argument("--lines", default="", help="Line number range to filter (e.g., 100:200)")
@@ -185,59 +181,8 @@ if args.lines:
     end = int(line_range[1])
     df = df[(df["line"] >= start) & (df["line"] <= end)]
 
-def make_report(df_in, path):
-    df = df_in.copy()
-    df = df.sort_values(
-        by=["non_ct_count", "filename", "line", "column"],
-        ascending=[False, True, True, True]
-    ).reset_index(drop=True)
-    in_ctchecker_series = df["in_ctchecker"]
-    df_to_report = df.drop(columns=["in_ctchecker"])
+out_dir = os.path.dirname(args.output_path)
+if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
 
-    def highlight_row(row):
-        if not in_ctchecker_series[row.name]:
-            return ["background-color: lightsalmon"] * len(row)
-        elif row["non_ct_count"] > 0:
-            return ["background-color: lightgreen"] * len(row)
-        elif row["visit_count"] == 0:
-            return ["background-color: lightcoral"] * len(row)
-        else:
-            return [""] * len(row)
-
-    styled = df_to_report.style.apply(highlight_row, axis=1)
-    styled.to_html(path, escape=False, na_rep="")
-
-make_report(df, args.report_path)
-
-def make_time_vulnerabilities_plot(df, name, path):
-    # Drop missing visit times
-    visited_times = df["visit_time"].dropna().sort_values().to_numpy()
-    confirmed_times = df["non_ct_time"].dropna().sort_values().to_numpy()
-
-    total_vulnerabilities = len(df)
-
-    # Time axis: combine all interesting timepoints
-    time_axis = np.unique(np.concatenate([visited_times, confirmed_times])) if (visited_times.size + confirmed_times.size) > 0 else np.array([0.0])
-
-    visited_counts = []
-    confirmed_counts = []
-
-    for t in time_axis:
-        visited_counts.append(np.sum(visited_times <= t))
-        confirmed_counts.append(np.sum(confirmed_times <= t))
-
-    # Plot
-    plt.figure(figsize=(8, 5))
-    plt.plot(time_axis, visited_counts, marker="o", linestyle="-", color="b", label=f"Visited ({visited_counts[-1] if visited_counts else 0})")
-    plt.plot(time_axis, confirmed_counts, marker="o", linestyle="-", color="g", label=f"Confirmed ({confirmed_counts[-1] if confirmed_counts else 0})")
-    plt.axhline(y=total_vulnerabilities, color="r", linestyle="--", label=f"Total ({total_vulnerabilities})")
-
-    plt.xlabel("Time (seconds)")
-    plt.ylabel("Number of Vulnerabilities")
-    plt.yticks(range(0, total_vulnerabilities + 1, max(1, total_vulnerabilities // 10)))
-    plt.title(name + " Vulnerabilities Over Time")
-    plt.legend()
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.savefig(path, dpi=300, bbox_inches="tight")
-
-make_time_vulnerabilities_plot(df, args.program_name, args.plot_path)
+df.to_json(args.output_path, orient="records", force_ascii=False)
