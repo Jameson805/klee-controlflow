@@ -3,7 +3,8 @@
 import pandas as pd
 import argparse
 import os
-import json
+
+from common import load_combined_json
 
 parser = argparse.ArgumentParser(description="Generate HTML report from combined CtChecker/KLEE JSON output.")
 parser.add_argument("input_json", help="Path to combined dataframe JSON (records orient)")
@@ -11,21 +12,7 @@ parser.add_argument("report_path", help="Path to save the output HTML report")
 args = parser.parse_args()
 
 def make_report_from_json(input_json, report_path):
-    # Support JSON written as {"data": [...], "dtypes": {col: dtype_str}}
-    with open(input_json, "r") as f:
-        obj = json.load(f)
-
-    if isinstance(obj, dict) and "data" in obj:
-        df = pd.DataFrame(obj["data"])
-        dtypes = obj.get("dtypes", {})
-        for col, dtype in dtypes.items():
-            if col in df.columns:
-                try:
-                    df[col] = df[col].astype(dtype)
-                except Exception:
-                    pass
-    else:
-        df = pd.read_json(input_json, orient="records")
+    df = load_combined_json(input_json)
 
     # Ensure expected columns exist
     if "in_ctchecker" not in df.columns:

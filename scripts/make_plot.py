@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import os
-import json
+
+from common import load_combined_json
 
 parser = argparse.ArgumentParser(description="Generate time-vulnerabilities plot from combined CtChecker/KLEE JSON output.")
 parser.add_argument("input_json", help="Path to combined dataframe JSON (records orient)")
@@ -14,48 +15,31 @@ parser.add_argument("plot_path", help="Path to save the output plot image")
 args = parser.parse_args()
 
 def make_time_vulnerabilities_plot_from_json(input_json, name, path):
-    # Support JSON written as {"data": [...], "dtypes": {col: dtype_str}}
-    with open(input_json, "r") as f:
-        obj = json.load(f)
-
-    if isinstance(obj, dict) and "data" in obj:
-        df = pd.DataFrame(obj["data"])
-        # Restore dtypes when provided
-        dtypes = obj.get("dtypes", {})
-        for col, dtype in dtypes.items():
-            if col in df.columns:
-                try:
-                    # Use pandas astype with dtype string
-                    df[col] = df[col].astype(dtype)
-                except Exception:
-                    # If dtype conversion fails, skip and leave as-is
-                    pass
-    else:
-        df = pd.read_json(input_json, orient="records")
+    df = load_combined_json(input_json)
 
     # Drop missing visit times
     visited_times = df.get("visit_time", pd.Series([], dtype=float)).dropna().sort_values().to_numpy()
-    confirmed_times = df.get("non_ct_time", pd.Series([], dtype=float)).dropna().sort_values().to_numpy()
+    counterexample_times = df.get("non_ct_time", pd.Series([], dtype=float)).dropna().sort_values().to_numpy()
 
     total_vulnerabilities = len(df)
 
     # Time axis: combine all interesting timepoints
-    if visited_times.size + confirmed_times.size > 0:
-        time_axis = np.unique(np.concatenate([visited_times, confirmed_times]))
+    if visited_times.size + counterexample_times.size > 0:
+        time_axis = np.unique(np.concatenate([visited_times, counterexample_times]))
     else:
         time_axis = np.array([0.0])
 
     visited_counts = []
-    confirmed_counts = []
+    counterexample_counts = []
 
     for t in time_axis:
         visited_counts.append(np.sum(visited_times <= t))
-        confirmed_counts.append(np.sum(confirmed_times <= t))
+        counterexample_counts.append(np.sum(counterexample_times <= t))
 
     # Plot
     plt.figure(figsize=(8, 5))
     plt.plot(time_axis, visited_counts, marker="o", linestyle="-", color="b", label=f"Visited ({visited_counts[-1] if visited_counts else 0})")
-    plt.plot(time_axis, confirmed_counts, marker="o", linestyle="-", color="g", label=f"Confirmed ({confirmed_counts[-1] if confirmed_counts else 0})")
+    plt.plot(time_axis, counterexample_counts, marker="o", linestyle="-", color="g", label=f"Counterexample ({counterexample_counts[-1] if counterexample_counts else 0})")
     plt.axhline(y=total_vulnerabilities, color="r", linestyle="--", label=f"Total ({total_vulnerabilities})")
 
     plt.xlabel("Time (seconds)")

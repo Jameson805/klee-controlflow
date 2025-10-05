@@ -6,6 +6,8 @@ import argparse
 import os
 import json
 
+from common import save_combined_json
+
 parser = argparse.ArgumentParser(description="Join CtChecker and KLEE output and save combined data to JSON.")
 parser.add_argument("ctchecker_output", help="Path to CtChecker output file (results_with_source-WL-FS-SRC-1.txt)")
 parser.add_argument("klee_output", help="Path to KLEE output directory")
@@ -185,14 +187,4 @@ out_dir = os.path.dirname(args.output_path)
 if out_dir:
     os.makedirs(out_dir, exist_ok=True)
 
-# Save both data and dtypes so consumers can restore original pandas dtypes
-data_json = df.to_json(orient="records")
-dtypes = df.dtypes.astype(str).to_dict()
-
-out_obj = {
-    "data": json.loads(data_json),
-    "dtypes": dtypes
-}
-
-with open(args.output_path, "w") as f:
-    json.dump(out_obj, f, indent=2)
+save_combined_json(df, args.output_path)

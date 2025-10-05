@@ -64,3 +64,62 @@ Notes:
 - `--lines start:end`: optional filter to only include entries whose line number falls in the inclusive range `start:end`.
 
 The `compare_with_ctchecker.py` script writes the combined dataframe in JSON (records orient). This JSON is the single input to both `make_report.py` and `make_plot.py`.
+
+# Additional helper scripts
+
+## reproduce_positives.py
+
+### Purpose
+Re-run (reproduce) KLEE counterexamples to verify the reported divergent
+	instruction. For each row in the combined JSON with `non_ct_count > 0`, the
+	script extracts public and secret inputs from the corresponding KLEE
+	`branch_counterexample_<inst_id>.ktest` file, runs the program under a small
+	GDB tracing script (`trace.gdb`) and compares the traces for the original
+	and `__prime` secret variants to find the instruction that diverges.
+
+### Behavior
+- Accepts the same combined JSON produced by `compare_with_ctchecker.py` as
+		input.  
+	- For each positive (`non_ct_count > 0`) it sets a new column
+		`reproduced` on the dataframe: True if the repro finds the same
+		`filename:line:column`, False if the repro runs but finds a different site
+		or fails to resolve debug info, and left as NA for rows that are not
+		positives.  
+	- If `--output <path>` is provided the script writes the augmented
+		dataframe (including dtypes) using `save_combined_json()`.
+
+### Usage
+```
+scripts/reproduce_positives.py <combined.json> <klee-out-dir> <executable> \
+		--secret s1,s2 --public p1,p2 [--output out.json]
+```
+
+### Notes
+- The script expects `ktest-tool` and `gdb` on PATH and that the executable
+	contains DWARF debug info (compiled with `-g`).  It relies on `trace.gdb`
+	(located next to the script) to produce a textual trace that can be compared
+	between the original and `__prime` runs.
+
+## addrinfo.py
+
+### Purpose
+Small helper that maps an instruction address to the source file, line and
+	column using DWARF debug information found in an ELF executable. This is
+	used by `reproduce_positives.py` to map a diverging instruction address back
+	to a `filename:line:column` triple.
+
+### Behavior
+- Exposes `get_addr_info(executable_path, address)` which returns
+	`(filename, line, column)` or `None` if the address cannot be resolved.  
+- Also usable as a CLI tool; it accepts an executable path and a hex address
+	and prints `filename:line:column` on success.
+
+### Usage
+```
+python3 scripts/addrinfo.py /path/to/executable 0x40114b
+```
+
+### Notes
+- Requires `pyelftools` to be installed (the repository already uses it in
+	other helper scripts).  The executable must be compiled with DWARF debug
+	info (e.g., `-g`).
