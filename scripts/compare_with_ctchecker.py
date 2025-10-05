@@ -185,4 +185,14 @@ out_dir = os.path.dirname(args.output_path)
 if out_dir:
     os.makedirs(out_dir, exist_ok=True)
 
-df.to_json(args.output_path, orient="records", force_ascii=False)
+# Save both data and dtypes so consumers can restore original pandas dtypes
+data_json = df.to_json(orient="records")
+dtypes = df.dtypes.astype(str).to_dict()
+
+out_obj = {
+    "data": json.loads(data_json),
+    "dtypes": dtypes
+}
+
+with open(args.output_path, "w") as f:
+    json.dump(out_obj, f, indent=2)

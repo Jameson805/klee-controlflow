@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import os
+import json
 
 parser = argparse.ArgumentParser(description="Generate time-vulnerabilities plot from combined CtChecker/KLEE JSON output.")
 parser.add_argument("input_json", help="Path to combined dataframe JSON (records orient)")
@@ -13,7 +14,24 @@ parser.add_argument("plot_path", help="Path to save the output plot image")
 args = parser.parse_args()
 
 def make_time_vulnerabilities_plot_from_json(input_json, name, path):
-    df = pd.read_json(input_json, orient="records")
+    # Support JSON written as {"data": [...], "dtypes": {col: dtype_str}}
+    with open(input_json, "r") as f:
+        obj = json.load(f)
+
+    if isinstance(obj, dict) and "data" in obj:
+        df = pd.DataFrame(obj["data"])
+        # Restore dtypes when provided
+        dtypes = obj.get("dtypes", {})
+        for col, dtype in dtypes.items():
+            if col in df.columns:
+                try:
+                    # Use pandas astype with dtype string
+                    df[col] = df[col].astype(dtype)
+                except Exception:
+                    # If dtype conversion fails, skip and leave as-is
+                    pass
+    else:
+        df = pd.read_json(input_json, orient="records")
 
     # Drop missing visit times
     visited_times = df.get("visit_time", pd.Series([], dtype=float)).dropna().sort_values().to_numpy()
