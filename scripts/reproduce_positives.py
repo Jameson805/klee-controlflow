@@ -38,6 +38,13 @@ def main():
         default=None,
         help="Path to write output JSON with reproduced column (optional)",
     )
+    parser.add_argument(
+        "--timeout",
+        required=False,
+        default=60,
+        type=int,
+        help="Maximum time (in seconds) to allow for each replay (default: 60s)",
+    )
     args = parser.parse_args()
 
     required_tools = ["ktest-tool", "gdb"]
@@ -57,12 +64,13 @@ def main():
     df["reproduced"] = pd.NA
 
     for idx, row in df[df["non_ct_count"] > 0].iterrows():
-        print(f"Reproducing {row['filename']}:{row['line']}:{row['column']} ...", end="", flush=True)
-        ktest_file = os.path.join(args.klee_output, f"branch_counterexample_{row['inst_id']}.ktest")
+        filename = f"branch_counterexample_{row['inst_id']}.ktest"
+        print(f"Reproducing {row['filename']}:{row['line']}:{row['column']} with {filename} ... ", end="", flush=True)
+        ktest_file = os.path.join(args.klee_output, filename)
 
         def extract_var(var):
             cmd = ["ktest-tool", "--extract", var, ktest_file]
-            proc = subprocess.run(cmd, capture_output=True)
+            proc = subprocess.run(cmd, check=True)
 
         for var in publics:
             extract_var(var)
@@ -74,11 +82,16 @@ def main():
             script = os.path.join(script_dir, "trace.gdb")
             var_files = [ktest_file + f".{v}" for v in vars]
             cmd = ["gdb", "-batch", "-x", script, "--args", args.executable] + var_files
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True, bufsize=-1, timeout=args.timeout)
             return proc.stdout
 
-        trace = run(secrets + publics)
-        trace_prime = run([f"{v}__prime" for v in secrets] + publics)
+        try:
+            trace = run(secrets + publics)
+            trace_prime = run([f"{v}__prime" for v in secrets] + publics)
+        except subprocess.TimeoutExpired:
+            print("Timeout")
+            df.at[idx, "reproduced"] = False
+            continue
 
         def get_diverging_addr():
             """compare line-by-line return the line before the first differing line"""
