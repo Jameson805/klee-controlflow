@@ -19,8 +19,8 @@ def make_report_from_json(input_json, report_path):
         df["in_ctchecker"] = True
 
     df = df.sort_values(
-        by=["non_ct_count", "filename", "line", "column"],
-        ascending=[False, True, True, True]
+        by=["filename", "line", "column"],
+        ascending=[True, True, True]
     ).reset_index(drop=True)
     in_ctchecker_series = df["in_ctchecker"]
     df_to_report = df.drop(columns=["in_ctchecker"]) if "in_ctchecker" in df.columns else df
