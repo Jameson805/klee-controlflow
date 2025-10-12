@@ -121,8 +121,8 @@ def load_and_aggregate_branches_from_messages(path, code_path_prefix=""):
 
     # Ensure dtypes
     agg["inst_id"] = agg["inst_id"].astype("Int64")
-    agg["visit_count"] = agg["visit_count"].astype("int64")
-    agg["non_ct_count"] = agg["non_ct_count"].astype("int64")
+    agg["visit_count"] = agg["visit_count"].astype("Int64")
+    agg["non_ct_count"] = agg["non_ct_count"].astype("Int64")
     agg["visit_time"] = agg["visit_time"].astype(float)
     agg["non_ct_time"] = agg["non_ct_time"].astype(float)
 
@@ -138,6 +138,9 @@ df_joined = df_ctchecker.merge(
     how="left",
     indicator=True
 )
+# Fill missing counts with 0 for entries that came from ctchecker only
+df_joined["visit_count"] = df_joined["visit_count"].fillna(0).astype("int64")
+df_joined["non_ct_count"] = df_joined["non_ct_count"].fillna(0).astype("int64")
 df_joined["in_ctchecker"] = df_joined["_merge"].apply(lambda x: x in ["both", "left_only"])
 df_joined = df_joined.drop(columns="_merge")
 
@@ -153,12 +156,6 @@ df_klee_only = df_klee_only[df_klee_only["_merge"] == "left_only"].drop(columns=
 df_klee_only["in_ctchecker"] = False
 
 df = pd.concat([df_joined, df_klee_only], ignore_index=True)
-
-df["inst_id"] = df["inst_id"].astype("Int64")
-# Fill missing counts with 0 for entries that came from ctchecker only
-df["visit_count"] = df["visit_count"].fillna(0).astype("int64")
-df["non_ct_count"] = df["non_ct_count"].fillna(0).astype("int64")
-# visit_time / non_ct_time may be NaN if missing; keep as floats
 
 def get_code(code_path, filenames, lines):
     def get_line(filename, line_number):
