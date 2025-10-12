@@ -106,20 +106,43 @@ def main():
                     if i - 1 < 0:
                         return None
                     else:
-                        return int(lines[i - 1], 16)
-            return None
+                        return i, int(lines[i - 1], 16)
+            return None, None
 
-        info = get_addr_info(args.executable, get_diverging_addr())
-        if info is None:
-            print("Failed to get debug info")
+        pos, addr = get_diverging_addr()
+        if addr is None:
+            print("Failed with identical traces")
             df.at[idx, "reproduced"] = False
+            continue
+
+        info = get_addr_info(args.executable, addr)
+        if info is None:
+            print(f"Failed at 0x{addr:x}, ", end="")
+
+            def print_nearest():
+                """Walk backward in the trace to find an address with debug info"""
+                found = False
+                lines = trace.splitlines()
+                for j in range(pos, -1, -1):
+                    cur_info = get_addr_info(args.executable, int(lines[j], 16))
+                    if cur_info is not None:
+                        f, l, c = cur_info
+                        print(f"nearest debug info at 0x{addr:x} -> {f}:{l}:{c}")
+                        found = True
+                        break
+                if not found:
+                    print("no debug info found for previous addresses")
+            print_nearest()
+
+            df.at[idx, "reproduced"] = False
+
         else:
             file, line, col = info
             if (row["filename"] == file and row["line"] == line and row["column"] == col):
                 print("Success")
                 df.at[idx, "reproduced"] = True
             else:
-                print(f"Mismatch with {file}:{line}:{col}")
+                print(f"Failed at 0x{addr:x} -> {file}:{line}:{col}")
                 df.at[idx, "reproduced"] = False
 
     if args.output:

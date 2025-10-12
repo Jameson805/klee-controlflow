@@ -19,63 +19,34 @@ def get_addr_info(executable_path, address):
     best_match = None
 
     with open(executable_path, 'rb') as f:
-        try:
-            elffile = ELFFile(f)
+        elffile = ELFFile(f)
 
-            if not elffile.has_dwarf_info():
-                print(f"Warning: No DWARF info found in '{executable_path}'.")
-                print("Please compile the executable with the '-g' flag (e.g., 'gcc -g my_program.c -o my_program').")
-                return None
-
-            dwarfinfo = elffile.get_dwarf_info()
-
-            # Iterate over all Compilation Units (CUs) in the DWARF information.
-            # Each CU typically corresponds to one source file.
-            for cu in dwarfinfo.iter_CUs():
-                # Get the line program, which maps addresses to source code lines.
-                line_program = dwarfinfo.line_program_for_CU(cu)
-
-                # Get the full filenames for this CU. The line program entries
-                # only contain an index into this list.
-                cu_filenames = [entry.name.decode('utf-8') for entry in line_program['file_entry']]
-
-                # Iterate through all entries in the line program.
-                for entry in line_program.get_entries():
-                    # An entry can be a state marker or an end_sequence marker.
-                    # We are only interested in actual state information.
-                    if entry.state is None or entry.state.end_sequence:
-                        continue
-
-                    # The DWARF standard specifies that the address in a line program
-                    # entry is the address of the first byte of the instruction.
-                    # We want to find the entry with the highest address that is
-                    # still less than or equal to our target address.
-                    if entry.state.address <= address:
-                        # Check if this entry is a better match than the one we have.
-                        # "Better" means its address is closer to our target address.
-                        if best_match is None or entry.state.address > best_match['address']:
-                            best_match = {
-                                'address': entry.state.address,
-                                # The file index in DWARF is 1-based, so we subtract 1.
-                                'file': cu_filenames[entry.state.file - 1],
-                                'line': entry.state.line,
-                                'column': entry.state.column
-                            }
-                    # Because line program entries are ordered by address, if we find an
-                    # entry whose address is greater than our target, we know we won't
-                    # find any more relevant entries in this CU, so we can break early.
-                    elif entry.state.address > address:
-                        break
-
-        except Exception as e:
-            print(f"An error occurred while processing the file: {e}")
+        if not elffile.has_dwarf_info():
+            print(f"Warning: No DWARF info found in '{executable_path}'.")
+            print("Please compile the executable with the '-g' flag (e.g., 'gcc -g my_program.c -o my_program').")
             return None
 
-    if best_match:
-        return best_match['file'], best_match['line'], best_match['column']
-    else:
-        # This can happen if the address is outside the range of any compiled code.
-        return None
+        dwarfinfo = elffile.get_dwarf_info()
+
+        # Iterate over all Compilation Units (CUs) in the DWARF information.
+        # Each CU typically corresponds to one source file.
+        for cu in dwarfinfo.iter_CUs():
+            # Get the line program, which maps addresses to source code lines.
+            line_program = dwarfinfo.line_program_for_CU(cu)
+
+            # Get the full filenames for this CU. The line program entries
+            # only contain an index into this list.
+            cu_filenames = [entry.name.decode('utf-8') for entry in line_program['file_entry']]
+
+            for entry in line_program.get_entries():
+                if entry.state is None:
+                    continue
+
+                if entry.state.address == address:
+                    # The file index in DWARF is 1-based, so we subtract 1.
+                    return cu_filenames[entry.state.file - 1], entry.state.line, entry.state.column
+
+    return None
 
 
 if __name__ == '__main__':
