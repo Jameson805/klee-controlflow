@@ -1057,7 +1057,15 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   ConstraintSet constraintSet{current.constraints};
 
   if (!success) {
-    klee_warning("Query timed out (fork).");
+    {
+      Instruction *lastInst;
+      const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
+      if (!ii.file.empty()) {
+        klee_warning("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
+      } else {
+        klee_warning("Query timed out (fork).");
+      }
+    }
     constraintSet = {};
     ConstraintManager cm{constraintSet};
 
