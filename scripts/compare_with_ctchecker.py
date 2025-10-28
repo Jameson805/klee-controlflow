@@ -9,6 +9,7 @@ import json
 from common import save_combined_json
 
 parser = argparse.ArgumentParser(description="Join CtChecker and KLEE output and save combined data to JSON.")
+parser.add_argument("ct_type", choices=["branch", "memory"], help="Type of constant-time check: 'branch' or 'memory'")
 parser.add_argument("ctchecker_output", help="Path to CtChecker output file (results_with_source-WL-FS-SRC-1.txt)")
 parser.add_argument("klee_output", help="Path to KLEE output directory")
 parser.add_argument("output_path", help="Path to save the combined dataframe in JSON format")
@@ -17,32 +18,25 @@ parser.add_argument("--code-path", default="", help="Path to the source code for
 parser.add_argument("--lines", default="", help="Line number range to filter (e.g., 100:200)")
 args = parser.parse_args()
 
-def load_ctchecker(path, prefix):
+def load_ctchecker(ct_type, path, prefix):
     with open(path, "r") as f:
         data = json.load(f)
-    df = pd.DataFrame(data["branches"])
+    key = "branches" if ct_type == "branch" else "indices"
+    df = pd.DataFrame(data.get(key, []))
     df["filename"] = df["filename"].apply(lambda f: os.path.join(prefix, f))
     return df
 
-df_ctchecker = load_ctchecker(args.ctchecker_output, args.ctchecker_prefix)
+df_ctchecker = load_ctchecker(args.ct_type, args.ctchecker_output, args.ctchecker_prefix)
 
-def load_and_aggregate_branches_from_messages(path, code_path_prefix=""):
+def load_preaggregated_from_messages(path, tag, code_path_prefix=""):
     """
-    Parse messages.txt lines like:
-    KLEE: [BRANCH] {"col":17,"condition":"...","filename":"klee-example.c","inst_id":27,"line":13,"non_ct":true,"time":0.1}
-    The only mandatory fields are "inst_id" and "non_ct"; other fields may be missing.
-    Aggregate by inst_id:
-      - visit_count: total number of entries for that inst_id
-      - non_ct_count: number of entries with non_ct == True
-      - visit_time: minimum time among all entries (NaN if none)
-      - non_ct_time: minimum time among entries with non_ct == True (NaN if none)
-    Returns a DataFrame with columns:
-      filename, line, column, inst_id, visit_count, non_ct_count, visit_time, non_ct_time
+    Parse KLEE messages.txt entries tagged as [tag] that already contain aggregated data.
+    Each entry is expected to carry visit/non-constant-time counters and timing information.
     """
-    branch_entries = []
+    entries = []
     with open(path, "r") as f:
         for line in f:
-            if not line.startswith("KLEE: [BRANCH]"):
+            if not line.startswith(f"KLEE: [{tag}]"):
                 continue
             idx = line.find("{")
             if idx == -1:
@@ -51,85 +45,54 @@ def load_and_aggregate_branches_from_messages(path, code_path_prefix=""):
                 payload = json.loads(line[idx:])
             except json.JSONDecodeError:
                 continue
-            # inst_id is mandatory; skip if missing or invalid
-            inst_id = payload.get("inst_id")
-            if inst_id is None:
+            try:
+                inst_id = int(payload.get("inst_id"))
+            except (TypeError, ValueError):
                 continue
-            try:
-                inst_id = int(inst_id)
-            except Exception:
-                continue
-            non_ct = bool(payload.get("non_ct", False))
-            filename = payload.get("filename")
-            raw_line = payload.get("line")
-            raw_col = payload.get("col")
-            raw_time = payload.get("time")
 
-            # Normalize optional numeric fields; use NaN when missing/invalid
-            try:
-                line_no = int(raw_line) if raw_line is not None else np.nan
-            except Exception:
-                line_no = np.nan
-            try:
-                col = int(raw_col) if raw_col is not None else np.nan
-            except Exception:
-                col = np.nan
-            try:
-                time_val = float(raw_time) if raw_time is not None else np.nan
-            except Exception:
-                time_val = np.nan
+            def to_int(value):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return np.nan
 
-            branch_entries.append({
+            def to_float(value):
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return np.nan
+
+            entries.append({
+                "filename": payload.get("filename"),
+                "line": to_int(payload.get("line")),
+                "column": to_int(payload.get("col")),
                 "inst_id": inst_id,
-                "filename": filename,
-                "line": line_no,
-                "column": col,
-                "time": time_val,
-                "non_ct": non_ct
+                "visit_count": to_int(payload.get("visit_count")),
+                "non_ct_count": to_int(payload.get("non_ct_count")),
+                "visit_time": to_float(payload.get("visit_time")),
+                "non_ct_time": to_float(payload.get("non_ct_time"))
             })
 
-    if not branch_entries:
-        return pd.DataFrame(columns=["filename", "line", "column", "inst_id", "visit_count", "non_ct_count", "visit_time", "non_ct_time"])
+    columns = ["filename", "line", "column", "inst_id", "visit_count", "non_ct_count", "visit_time", "non_ct_time"]
+    if not entries:
+        return pd.DataFrame(columns=columns)
 
-    df_be = pd.DataFrame(branch_entries)
+    df = pd.DataFrame(entries, columns=columns)
+    df["inst_id"] = pd.to_numeric(df["inst_id"], errors="coerce").astype("Int64")
+    for col in ["line", "column", "visit_count", "non_ct_count"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    for col in ["visit_time", "non_ct_time"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Aggregate by inst_id. Keep first non-missing filename/line/column when available.
-    def first_non_na(series):
-        s = series.dropna()
-        return s.iloc[0] if not s.empty else (None if series.name == "filename" else np.nan)
+    df = df.drop_duplicates(subset=["inst_id"], keep="first")
 
-    def min_time_ignore_na(t):
-        t2 = t.dropna()
-        return float(t2.min()) if not t2.empty else np.nan
+    return df
 
-    # For non_ct_time we need min time among rows where non_ct is True
-    def min_time_for_nonct(t):
-        mask = df_be.loc[t.index, "non_ct"] & t.notna()
-        if mask.any():
-            return float(t[mask].min())
-        return np.nan
-
-    agg = df_be.groupby("inst_id").agg(
-        filename=pd.NamedAgg(column="filename", aggfunc=first_non_na),
-        line=pd.NamedAgg(column="line", aggfunc=first_non_na),
-        column=pd.NamedAgg(column="column", aggfunc=first_non_na),
-        visit_count=pd.NamedAgg(column="inst_id", aggfunc="count"),
-        non_ct_count=pd.NamedAgg(column="non_ct", aggfunc=lambda s: int(s.sum())),
-        visit_time=pd.NamedAgg(column="time", aggfunc=min_time_ignore_na),
-        non_ct_time=pd.NamedAgg(column="time", aggfunc=min_time_for_nonct)
-    ).reset_index()
-
-    # Ensure dtypes
-    agg["inst_id"] = agg["inst_id"].astype("Int64")
-    agg["visit_count"] = agg["visit_count"].astype("Int64")
-    agg["non_ct_count"] = agg["non_ct_count"].astype("Int64")
-    agg["visit_time"] = agg["visit_time"].astype(float)
-    agg["non_ct_time"] = agg["non_ct_time"].astype(float)
-
-    return agg
-
-# Build df_klee from messages.txt instead of visited_branches.json
-df_klee = load_and_aggregate_branches_from_messages(os.path.join(args.klee_output, "messages.txt"), args.code_path)
+# Build df_klee from messages.txt based on ct_type
+if args.ct_type == "branch":
+    df_klee = load_preaggregated_from_messages(os.path.join(args.klee_output, "messages.txt"), "BRANCH", args.code_path)
+else:
+    df_klee = load_preaggregated_from_messages(os.path.join(args.klee_output, "messages.txt"), "MEMORY", args.code_path)
 
 # Join all the positives reported by CtChecker
 df_joined = df_ctchecker.merge(
@@ -138,9 +101,9 @@ df_joined = df_ctchecker.merge(
     how="left",
     indicator=True
 )
-# Fill missing counts with 0 for entries that came from ctchecker only
-df_joined["visit_count"] = df_joined["visit_count"].fillna(0).astype("int64")
-df_joined["non_ct_count"] = df_joined["non_ct_count"].fillna(0).astype("int64")
+# Fill missing counts with 0 for entries that came from ctchecker only (avoid FutureWarning by ensuring numeric dtype first)
+df_joined["visit_count"] = pd.to_numeric(df_joined["visit_count"], errors="coerce").fillna(0).astype("int64")
+df_joined["non_ct_count"] = pd.to_numeric(df_joined["non_ct_count"], errors="coerce").fillna(0).astype("int64")
 df_joined["in_ctchecker"] = df_joined["_merge"].apply(lambda x: x in ["both", "left_only"])
 df_joined = df_joined.drop(columns="_merge")
 

@@ -13,10 +13,15 @@
 #include "CallPathManager.h"
 #include "klee/System/Time.h"
 #include "klee/Support/json.hpp"
+#include "klee/Core/NonCtType.h"
+
+#include "klee/Support/json.hpp"
+using json = nlohmann::json;
 
 #include <memory>
 #include <set>
 #include <sqlite3.h>
+#include <array>
 
 using json = nlohmann::json;
 
@@ -58,8 +63,13 @@ namespace klee {
 
     bool updateMinDistToUncovered;
 
-    // Instruction ID of non-CT branches
-    std::set<unsigned> nonCtBranches;
+    struct NonCtInfo {
+      unsigned visitCount{0};
+      unsigned nonCtCount{0};
+      std::optional<double> visitTime;
+      std::optional<double> nonCtTime;
+    };
+    std::array<std::map<KInstruction *, NonCtInfo>, 2> nonCtInfo;
 
   public:
     static bool useStatistics();
@@ -105,8 +115,9 @@ namespace klee {
 
     void computeReachableUncovered();
 
-    // Mark non-CT branch as visited and return if there was no counterexample before
-    bool visitNonCtBranch(unsigned instId);
+    // Record branch and memory access info, return if there was no counterexample before
+    bool visitNonCt(NonCtType type, bool isNonCt, KInstruction *ki, double time);
+    void printNonCt();
   };
 
   uint64_t computeMinDistToUncovered(const KInstruction *ki,

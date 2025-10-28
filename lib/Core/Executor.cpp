@@ -2291,67 +2291,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> cond = eval(ki, 0, state).value;
       cond = optimizer.optimizeExpr(cond, false);
 
-      // Check CT: only consider non-constant branch conditions
-      if (!isa<ConstantExpr>(cond)) {
-        double time{wallTimer.delta().toSeconds()};
-        unsigned instId{ki->info->id};
-        // Get branch location in source code
-        std::string filename;
-        unsigned line{0}, col{0};
-        std::string condStr;
-        if (i->getDebugLoc()) {
-          DebugLoc loc = i->getDebugLoc();
-          filename = loc->getFilename().str();
-          line = loc.getLine();
-          col = loc.getCol();
-
-          llvm::raw_string_ostream rso(condStr);
-          cond->print(rso);
-          rso.flush();
-        }
-
-        Assignments assignments;
-        bool nonCt{getBranchCounterexample(assignments, state, cond)};
-
-        if (nonCt) {
-          // Print to console and write test case if first counterexample
-          if (statsTracker->visitNonCtBranch(instId)) {
-            klee_message("[NON-CT BRANCH] %lf : %u : %s : %u : %u", time, instId, filename.c_str(), line, col);
-            writeTestCaseKTest(assignments, "branch_counterexample_" + std::to_string(instId) + ".ktest");
-          }
-        }
-
-        json j;
-        j["time"] = time;
-        j["inst_id"] = instId;
-        j["filename"] = filename;
-        j["line"] = line;
-        j["col"] = col;
-        j["condition"] = condStr;
-        j["non_ct"] = nonCt;
-
-        json j_constraints = json::array();
-        std::size_t i{0};
-        assert(
-          state.constraints.size() == state.constraints.getInsts().size()
-          && "each constraint should correspond to an instruction id"
-        );
-        for (const ref<Expr> &c : state.constraints) {
-          json item;
-          item["inst_id"] = state.constraints.getInsts()[i++];
-
-          std::string cstr;
-          llvm::raw_string_ostream rso(cstr);
-          c->print(rso);
-          rso.flush();
-          item["constraint"] = cstr;
-
-          j_constraints.push_back(item);
-        }
-        j["constraints"] = std::move(j_constraints);
-
-        klee_message_to_file("[BRANCH] %s",  j.dump().c_str());
-      }
+      checkLogCounterexample(NonCtType::Branch, state, ki, cond);
 
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
@@ -2919,11 +2859,17 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
   case Instruction::Load: {
     ref<Expr> base = eval(ki, 0, state).value;
+
+    checkLogCounterexample(NonCtType::Memory, state, ki, base);
+
     executeMemoryOperation(state, false, base, 0, ki);
     break;
   }
   case Instruction::Store: {
     ref<Expr> base = eval(ki, 1, state).value;
+
+    checkLogCounterexample(NonCtType::Memory, state, ki, base);
+
     ref<Expr> value = eval(ki, 0, state).value;
     executeMemoryOperation(state, true, base, value, 0);
     break;
@@ -3832,6 +3778,7 @@ void Executor::run(ExecutionState &initialState) {
   delete searcher;
   searcher = nullptr;
 
+  statsTracker->printNonCt();
   doDumpStates();
 }
 
@@ -4916,6 +4863,11 @@ void Executor::runFunctionAsMain(Function *f,
     statsTracker->done();
 }
 
+void Executor::setHaltExecution(bool value) {
+  haltExecution = value;
+  statsTracker->printNonCt();
+}
+
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
   assert(pathWriter);
   return state.pathOS.getID();
@@ -5225,12 +5177,13 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
   return {hasSecret, e->rebuild(kids.data())};
 }
 
-bool Executor::getBranchCounterexample(Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
+bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
 {
   auto [hasSecret, renamedCond]{renameSecret(cond)};
   if (!hasSecret) return false;
 
-  ConstraintSet extendedConstraints{state.constraints};
+  ConstraintSet extendedConstraints;
+  if (type == NonCtType::Branch) extendedConstraints = state.constraints;
   ConstraintManager cm{extendedConstraints};
 
   #define CHECK_ADD(COND) \
@@ -5257,8 +5210,7 @@ bool Executor::getBranchCounterexample(Assignments &assignments, const Execution
       } \
     }
 
-  CHECK_ADD(cond);
-  CHECK_ADD(NotExpr::create(renamedCond));
+  CHECK_ADD(NeExpr::create(cond, renamedCond));
 
   std::vector<const Array*> objects;
   for (const auto &[_, a] : state.symbolics)
@@ -5290,6 +5242,66 @@ bool Executor::getBranchCounterexample(Assignments &assignments, const Execution
     assignments.push_back(std::make_pair(objects[i]->name, values[i]));
   }
   return true;
+}
+
+void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond)
+{
+  Assignments assignments;
+  bool nonCt{getCounterexample(type, assignments, state, cond)};
+
+  double time{wallTimer.delta().toSeconds()};
+
+  unsigned instId{ki->info->id};
+  std::string filename;
+  unsigned line{0}, col{0};
+  if (ki->inst->getDebugLoc()) {
+    DebugLoc loc = ki->inst->getDebugLoc();
+    filename = loc->getFilename().str();
+    line = loc.getLine();
+    col = loc.getCol();
+  }
+
+  // Print to console and write test case if first counterexample
+  if (statsTracker->visitNonCt(type, nonCt, ki, time)) {
+    std::string prefix{type == NonCtType::Branch ? "[NON-CT BRANCH]" : "[NON-CT MEMORY]"};
+    klee_message((prefix + " %lf : %u : %s : %u : %u").c_str(), time, instId, filename.c_str(), line, col);
+    std::string filePrefix{type == NonCtType::Branch ? "branch_counterexample_" : "memory_counterexample_"};
+    writeTestCaseKTest(assignments, filePrefix + std::to_string(instId) + ".ktest");
+  }
+
+  // TODO: Print constraints
+
+  // json j;
+  // j["time"] = time;
+  // j["inst_id"] = instId;
+  // j["filename"] = filename;
+  // j["line"] = line;
+  // j["col"] = col;
+  // j["condition"] = condStr;
+  // j["non_ct"] = nonCt;
+
+  // json j_constraints = json::array();
+  // std::size_t i{0};
+  // assert(
+  //   state.constraints.size() == state.constraints.getInsts().size()
+  //   && "each constraint should correspond to an instruction id"
+  // );
+  // for (const ref<Expr> &c : state.constraints) {
+  //   json item;
+  //   item["inst_id"] = state.constraints.getInsts()[i++];
+
+  //   std::string cstr;
+  //   llvm::raw_string_ostream rso(cstr);
+  //   c->print(rso);
+  //   rso.flush();
+  //   item["constraint"] = cstr;
+
+  //   j_constraints.push_back(item);
+  // }
+  // j["constraints"] = std::move(j_constraints);
+
+  // std::string prefix{type == NonCtType::Branch ? "[BRANCH]" : "[MEMORY]"};
+  // klee_message_to_file((prefix + " %s").c_str(), j.dump().c_str());
 }
 
 // XXX: Adopted from main.cpp

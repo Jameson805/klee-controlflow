@@ -46,6 +46,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/Support/Process.h"
 DISABLE_WARNING_POP
 
+#include <array>
 #include <fstream>
 #include <unistd.h>
 
@@ -1064,13 +1065,53 @@ void StatsTracker::computeReachableUncovered() {
   }
 }
 
-bool StatsTracker::visitNonCtBranch(unsigned instId)
-{
-  if (nonCtBranches.find(instId) == nonCtBranches.end()) {
-    nonCtBranches.insert(instId);
-    return true;
+bool StatsTracker::visitNonCt(NonCtType type, bool isNonCt, KInstruction *ki, double time) {
+  std::map<KInstruction *, NonCtInfo> &m{nonCtInfo[static_cast<size_t>(type)]};
+  NonCtInfo &info = m[ki];
+
+  bool firstNonCt{false};
+
+  if (info.visitCount == 0) info.visitTime = time;
+  ++info.visitCount;
+  if (isNonCt) {
+    if (info.nonCtCount == 0) {
+      info.nonCtTime = time;
+      firstNonCt = true;
+    }
+    ++info.nonCtCount;
   }
-  else {
-    return false;
+
+  return firstNonCt;
+}
+
+// TODO: Write to a separate file
+void StatsTracker::printNonCt() {
+  klee_message("Printing non-CT statistics");
+  for (int i{0}; i < 2; ++i)
+  {
+    for (const auto &[ki, info] : nonCtInfo[i]) {
+      unsigned instId{ki->info->id};
+      std::string filename;
+      unsigned line{0}, col{0};
+      if (ki->inst->getDebugLoc()) {
+        DebugLoc loc = ki->inst->getDebugLoc();
+        filename = loc->getFilename().str();
+        line = loc.getLine();
+        col = loc.getCol();
+      }
+
+      json j;
+      j["inst_id"] = instId;
+      j["filename"] = filename;
+      j["line"] = line;
+      j["col"] = col;
+      j["visit_count"] = info.visitCount;
+      j["non_ct_count"] = info.nonCtCount;
+      j["visit_time"] = info.visitTime;
+      j["non_ct_time"] = info.nonCtTime;
+
+      std::string prefix{static_cast<NonCtType>(i) == NonCtType::Branch ? "[BRANCH]" : "[MEMORY]"};
+      klee_message_to_file((prefix + " %s").c_str(), j.dump().c_str());
+    }
   }
 }

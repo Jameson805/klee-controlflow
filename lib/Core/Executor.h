@@ -28,9 +28,7 @@
 #include "klee/Module/KInstruction.h"
 #include "klee/Module/KModule.h"
 #include "klee/System/Time.h"
-
-#include "klee/Support/json.hpp"
-using json = nlohmann::json;
+#include "klee/Core/NonCtType.h"
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
@@ -521,16 +519,13 @@ private:
   void dumpStates();
   void dumpExecutionTree();
 
-  // NEW: Writes control flow information to JSON file
-  void writeControlFlowJson(const ExecutionState &state) const;
-
-  // NEW: Rename all secret symbolics in expression to their prime counterpart
+  // Rename all secret symbolics in expression to their prime counterpart
   // Pair of (does it contain secret, renamed expression)
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
 
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
-  // New: Get counterexample for secret-dependent branch, return true if success
-  bool getBranchCounterexample(Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
+  bool getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
+  void checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond);
   bool writeTestCaseKTest(const Assignments &out, const std::string &testName);
 
 public:
@@ -572,7 +567,7 @@ public:
 
   /*** Runtime options ***/
 
-  void setHaltExecution(bool value) override { haltExecution = value; }
+  void setHaltExecution(bool value) override;
 
   void setInhibitForking(bool value) override { inhibitForking = value; }
 
