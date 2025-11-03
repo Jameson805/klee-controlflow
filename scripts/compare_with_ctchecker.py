@@ -15,6 +15,7 @@ parser.add_argument("klee_output", help="Path to KLEE output directory")
 parser.add_argument("output_path", help="Path to save the combined dataframe in JSON format")
 parser.add_argument("--ctchecker-prefix", default="", help="Prefix to the filenames in the CtChecker output (defaults to empty string)")
 parser.add_argument("--code-path", default="", help="Path to the source code for the filenames in the KLEE output (defaults to empty string)")
+parser.add_argument("--filename", default="", help="Filename to filter (e.g., main.c)")
 parser.add_argument("--lines", default="", help="Line number range to filter (e.g., 100:200)")
 args = parser.parse_args()
 
@@ -142,6 +143,9 @@ if args.lines:
     start = int(line_range[0])
     end = int(line_range[1])
     df = df[(df["line"] >= start) & (df["line"] <= end)]
+
+if args.filename:
+    df = df[df["filename"] == args.filename]
 
 out_dir = os.path.dirname(args.output_path)
 if out_dir:
