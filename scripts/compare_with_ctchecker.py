@@ -13,21 +13,23 @@ parser.add_argument("ct_type", choices=["branch", "memory"], help="Type of const
 parser.add_argument("ctchecker_output", help="Path to CtChecker output file (results_with_source-WL-FS-SRC-1.txt)")
 parser.add_argument("klee_output", help="Path to KLEE output directory")
 parser.add_argument("output_path", help="Path to save the combined dataframe in JSON format")
-parser.add_argument("--ctchecker-prefix", default="", help="Prefix to the filenames in the CtChecker output (defaults to empty string)")
 parser.add_argument("--code-path", default="", help="Path to the source code for the filenames in the KLEE output (defaults to empty string)")
 parser.add_argument("--filename", default="", help="Filename to filter (e.g., main.c)")
 parser.add_argument("--lines", default="", help="Line number range to filter (e.g., 100:200)")
+parser.add_argument(
+    "--src-prefix",
+    default="",
+    help="If set, keep only KLEE rows whose filename starts with this prefix and strip the prefix from the filename (e.g., 'crypto/bn' makes 'crypto/bn/bn_exp.c' -> 'bn_exp.c')."
+)
 args = parser.parse_args()
 
-def load_ctchecker(ct_type, path, prefix):
+def load_ctchecker(ct_type, path):
     with open(path, "r") as f:
         data = json.load(f)
     key = "branches" if ct_type == "branch" else "indices"
-    df = pd.DataFrame(data.get(key, []))
-    df["filename"] = df["filename"].apply(lambda f: os.path.join(prefix, f))
-    return df
+    return pd.DataFrame(data.get(key, []))
 
-df_ctchecker = load_ctchecker(args.ct_type, args.ctchecker_output, args.ctchecker_prefix)
+df_ctchecker = load_ctchecker(args.ct_type, args.ctchecker_output)
 
 def load_preaggregated_from_messages(path, tag, code_path_prefix=""):
     """
@@ -94,6 +96,43 @@ if args.ct_type == "branch":
     df_klee = load_preaggregated_from_messages(os.path.join(args.klee_output, "messages.txt"), "BRANCH", args.code_path)
 else:
     df_klee = load_preaggregated_from_messages(os.path.join(args.klee_output, "messages.txt"), "MEMORY", args.code_path)
+
+# Optionally filter and normalize KLEE filenames by a source prefix
+if args.src_prefix:
+    pref_parts = [p for p in os.path.normpath(args.src_prefix).split(os.sep) if p not in ("", ".")]
+
+    def _split_parts(name):
+        if not isinstance(name, str):
+            return None
+        return [p for p in os.path.normpath(name).split(os.sep) if p not in ("", ".")]
+
+    def _find_subseq(parts, subseq):
+        if parts is None or not subseq:
+            return -1
+        n, m = len(parts), len(subseq)
+        if m > n:
+            return -1
+        for i in range(n - m + 1):
+            if parts[i:i + m] == subseq:
+                return i
+        return -1
+
+    def _has_prefix(name):
+        parts = _split_parts(name)
+        return _find_subseq(parts, pref_parts) != -1
+
+    def _strip_prefix(name):
+        parts = _split_parts(name)
+        idx = _find_subseq(parts, pref_parts)
+        if idx == -1:
+            return name
+        rest = parts[idx + len(pref_parts):]
+        return os.path.join(*rest) if rest else ""
+
+    if not df_klee.empty and "filename" in df_klee.columns:
+        mask = df_klee["filename"].apply(_has_prefix)
+        df_klee = df_klee[mask].copy()
+        df_klee["filename"] = df_klee["filename"].apply(_strip_prefix)
 
 # Join all the positives reported by CtChecker
 df_joined = df_ctchecker.merge(
