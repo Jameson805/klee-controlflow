@@ -1066,6 +1066,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
         klee_warning("Query timed out (fork).");
       }
     }
+
+    // On timeout, concretize public inputs and re-solve
     constraintSet = {};
     ConstraintManager cm{constraintSet};
 
@@ -1084,14 +1086,17 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       {
         for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
         {
-          cm.addConstraint(
-              EqExpr::alloc(
-                ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
-                  ConstantExpr::alloc(j, current.symbolics[i].second->domain)
-                ),
-                ConstantExpr::alloc(values[i][j], Expr::Int8)
-              )
-          );
+          if (!current.symbolics[i].second->isSecret)
+          {
+            cm.addConstraint(
+                EqExpr::alloc(
+                  ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
+                    ConstantExpr::alloc(j, current.symbolics[i].second->domain)
+                  ),
+                  ConstantExpr::alloc(values[i][j], Expr::Int8)
+                )
+            );
+          }
         }
 
         solver->setTimeout(timeout);
