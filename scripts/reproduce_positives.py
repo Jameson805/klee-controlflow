@@ -4,10 +4,11 @@ import argparse
 import os
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import pandas as pd
 import shutil
+import tempfile  # new
 
 from common import load_combined_json, save_combined_json
 from addrinfo import get_addr_info
@@ -31,22 +32,41 @@ def require_tools(tools: List[str]) -> None:
 
 
 def run_gdb_trace(executable: str, arg_files: List[str], timeout: int) -> str:
-    """Run gdb batch trace script and return stdout (trace of PCs)."""
+    """Run gdb batch trace script and return stdout (trace of PCs).
+
+    On non-zero exit, print stdout/stderr so the user can inspect the failure.
+    """
     script = os.path.join(script_dir, "trace.gdb")
     cmd = ["gdb", "-batch", "-x", script, "--args", executable] + arg_files
     proc = subprocess.run(
         cmd,
-        check=True,
+        # check=False so we can inspect stdout/stderr on failure
+        check=False,
         capture_output=True,
         text=True,
         bufsize=-1,
         timeout=timeout,
     )
+    if proc.returncode != 0:
+        print(
+            f"gdb exited with status {proc.returncode} running: {' '.join(cmd)}",
+            file=sys.stderr,
+        )
+        if proc.stdout:
+            print("=== gdb stdout ===", file=sys.stderr)
+            print(proc.stdout, file=sys.stderr, end="")
+        if proc.stderr:
+            print("=== gdb stderr ===", file=sys.stderr)
+            print(proc.stderr, file=sys.stderr, end="")
+        # Re-raise as CalledProcessError to keep existing error handling semantics
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
+        )
     return proc.stdout
 
 
-def compare_traces_first_diff(trace_a: str, trace_b: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """Return (index, addr_a, addr_b) at first differing line; None if identical."""
+def analyze_traces(trace_a: str, trace_b: str) -> Dict[str, Optional[int]]:
+    """Return dict with first_diff_index, addr_a, addr_b, prev_addr."""
     lines_a = trace_a.splitlines()
     lines_b = trace_b.splitlines()
     max_len = max(len(lines_a), len(lines_b))
@@ -56,102 +76,79 @@ def compare_traces_first_diff(trace_a: str, trace_b: str) -> Tuple[Optional[int]
         if a != b:
             addr_a = int(a, 16) if a is not None else None
             addr_b = int(b, 16) if b is not None else None
-            return i, addr_a, addr_b
-    return None, None, None
-
-
-def compare_traces_prev_same(trace_a: str, trace_b: str) -> Tuple[Optional[int], Optional[int]]:
-    """Return (index, addr_prev) where addr_prev is the line BEFORE first diff; None if identical."""
-    lines_a = trace_a.splitlines()
-    lines_b = trace_b.splitlines()
-    max_len = max(len(lines_a), len(lines_b))
-    for i in range(max_len):
-        a = lines_a[i] if i < len(lines_a) else None
-        b = lines_b[i] if i < len(lines_b) else None
-        if a != b:
-            if i - 1 < 0:
-                return None, None
-            return i, int(lines_a[i - 1], 16)
-    return None, None
-
-
-def format_addr_info(executable: str, addr: Optional[int]) -> str:
-    if addr is None:
-        return "<no address>"
-    info = get_addr_info(executable, addr)
-    if info is None:
-        return f"0x{addr:x}: <no debug info>"
-    file, line, col = info
-    src_line = None
-    try:
-        with open(file, "r", encoding="utf-8", errors="ignore") as f:
-            for i, content in enumerate(f, start=1):
-                if i == line:
-                    src_line = content.rstrip("\n")
-                    break
-    except Exception:
-        src_line = None
-    if src_line is not None:
-        return f"0x{addr:x}: {file}:{line}:{col} | {src_line}"
-    else:
-        return f"0x{addr:x}: {file}:{line}:{col}"
+            prev_addr = None
+            if i - 1 >= 0 and i - 1 < len(lines_a):
+                try:
+                    prev_addr = int(lines_a[i - 1], 16)
+                except Exception:
+                    prev_addr = None
+            return {
+                "first_diff_index": i,
+                "addr_a": addr_a,
+                "addr_b": addr_b,
+                "prev_addr": prev_addr,
+            }
+    return {
+        "first_diff_index": None,
+        "addr_a": None,
+        "addr_b": None,
+        "prev_addr": None,
+    }
 
 
 def print_nearest_debug_info(
     executable: str,
     trace_text: str,
     start_index: int,
-    failed_addr: Optional[int],
-    mode_label: Optional[str] = None,
 ) -> bool:
     """Walk backward from start_index (bounded) to find the nearest addr with debug info and print it.
 
-    If mode_label is None, prints like original dataframe mode:
+    print:
       nearest debug info at 0x<failed_addr> -> file:line:col
-
-    If mode_label is provided (e.g., "  run A"), prints:
-      <mode_label> nearest: 0xADDR: file:line:col | <source>
 
     Returns True if something was printed (found), else prints a 'no debug info' message and returns False.
     """
     lines = trace_text.splitlines()
     if not lines:
-        if mode_label:
-            print(f"{mode_label}: no debug info found for previous addresses")
-        else:
-            print("no debug info found for previous addresses")
+        print("no debug info found for previous addresses")
         return False
 
     start = min(max(start_index, 0), len(lines) - 1)
-    steps = 0
     j = start
     while j >= 0:
         try:
             addr = int(lines[j], 16)
         except Exception:
             j -= 1
-            steps += 1
             continue
         info = get_addr_info(executable, addr)
         if info is not None:
-            if mode_label:
-                print(f"{mode_label} nearest:", format_addr_info(executable, addr))
-            else:
-                f, l, c = info
-                # Match previous text exactly for dataframe mode
-                if failed_addr is not None:
-                    print(f"nearest debug info at 0x{failed_addr:x} -> {f}:{l}:{c}")
-                else:
-                    print(f"nearest debug info -> {f}:{l}:{c}")
+            f, l, c = info
+            print(f"nearest debug info at 0x{addr:x} -> {f}:{l}:{c}")
             return True
         j -= 1
-        steps += 1
 
-    if mode_label:
-        print(f"{mode_label}: no debug info found for previous addresses")
-    else:
-        print("no debug info found for previous addresses")
+    print("no debug info found for previous addresses")
     return False
+
+
+def extract_inputs(ktest_file: str, secrets: List[str], publics: List[str]) -> None:
+    """Extract variables (including secret primes) using ktest-tool."""
+    def extract_var(var: str) -> None:
+        cmd = ["ktest-tool", "--extract", var, ktest_file]
+        subprocess.run(cmd, check=True)
+    for v in publics:
+        extract_var(v)
+    for s in secrets:
+        extract_var(s)
+        extract_var(f"{s}__prime")
+
+
+def run_traces(executable: str, ktest_file: str, secrets: List[str], publics: List[str], timeout: int) -> Tuple[str, str]:
+    """Run original (secrets) and prime (secret__prime) traces."""
+    trace_a = run_gdb_trace(executable, [ktest_file + f".{v}" for v in secrets + publics], timeout)
+    trace_b = run_gdb_trace(executable, [ktest_file + f".{v}__prime" for v in secrets] + [ktest_file + f".{v}" for v in publics], timeout)
+    return trace_a, trace_b
 
 
 def mode_dataframe(input_json: str, klee_output: str, executable: str, secret: str, public: str, timeout: int, output: Optional[str]) -> None:
@@ -173,203 +170,285 @@ def mode_dataframe(input_json: str, klee_output: str, executable: str, secret: s
         )
         ktest_file = os.path.join(klee_output, filename)
 
-        def extract_var(var: str) -> None:
-            cmd = ["ktest-tool", "--extract", var, ktest_file]
-            subprocess.run(cmd, check=True)
-
-        # Extract public and secret variables
-        for var in publics:
-            extract_var(var)
-        for var in secrets:
-            extract_var(var)
-            extract_var(f"{var}__prime")
-
-        def run_with_vars(vars_: List[str]) -> str:
-            var_files = [ktest_file + f".{v}" for v in vars_]
-            return run_gdb_trace(executable, var_files, timeout)
-
         try:
-            trace = run_with_vars(secrets + publics)
-            trace_prime = run_with_vars([f"{v}__prime" for v in secrets] + publics)
+            extract_inputs(ktest_file, secrets, publics)
+            trace_a, trace_b = run_traces(executable, ktest_file, secrets, publics, timeout)
         except subprocess.TimeoutExpired:
             print("Timeout")
             df.at[idx, "reproduced"] = False
             continue
 
-        pos, addr_prev = compare_traces_prev_same(trace, trace_prime)
-        if addr_prev is None:
+        analysis = analyze_traces(trace_a, trace_b)
+        prev_addr = analysis["prev_addr"]
+        pos = analysis["first_diff_index"]
+        if prev_addr is None:
             print("Failed with identical traces")
             df.at[idx, "reproduced"] = False
             continue
 
-        info = get_addr_info(executable, addr_prev)
+        info = get_addr_info(executable, prev_addr)
         if info is None:
-            print(f"Failed at 0x{addr_prev:x}, ", end="")
+            print(f"Failed at 0x{prev_addr:x}, ", end="")
             start_idx = (pos - 1) if (pos is not None and pos > 0) else 0
-            print_nearest_debug_info(executable, trace, start_idx, addr_prev)
+            print_nearest_debug_info(executable, trace_a, start_idx)
             df.at[idx, "reproduced"] = False
         else:
-            file, line, col = info
-            if (
-                row["filename"] == file
-                and row["line"] == line
-                and row["column"] == col
-            ):
+            f, l, c = info
+            # NOTE: only compare basenames to avoid issues with different paths
+            if os.path.basename(row["filename"]) == os.path.basename(f) and row["line"] == l and row["column"] == c:
                 print("Success")
                 df.at[idx, "reproduced"] = True
             else:
-                print(f"Failed at 0x{addr_prev:x} -> {file}:{line}:{col}")
+                print(f"Failed at 0x{prev_addr:x} -> {f}:{l}:{c}")
                 df.at[idx, "reproduced"] = False
 
     if output:
         save_combined_json(df, output)
 
 
-def mode_files(executable: str, secret_files: str, secret_prime_files: str, public_files: str, timeout: int) -> int:
-    """New mode activated by leading '--': run two traces directly from provided input files.
+def mode_ktest_file(executable: str, ktest_file: str, secret: str, public: str, timeout: int) -> int:
+    """Run two traces for a single .ktest by extracting inputs like in dataframe mode."""
+    require_tools(["ktest-tool", "gdb"])
 
-    Returns process exit code (0 on success, non-zero on timeout or issues).
-    """
-    require_tools(["gdb"])
-
-    s_files = parse_list(secret_files) if secret_files else []
-    sp_files = parse_list(secret_prime_files) if secret_prime_files else []
-    p_files = parse_list(public_files) if public_files else []
-
-    if not s_files or not sp_files:
-        print("Error: --secret-files and --secret-prime-files are required in '--' mode.", file=sys.stderr)
-        return 2
+    secrets = parse_list(secret)
+    publics = parse_list(public)
 
     try:
-        trace_a = run_gdb_trace(executable, s_files + p_files, timeout)
-        trace_b = run_gdb_trace(executable, sp_files + p_files, timeout)
+        extract_inputs(ktest_file, secrets, publics)
+        trace_a, trace_b = run_traces(executable, ktest_file, secrets, publics, timeout)
     except subprocess.TimeoutExpired:
         print("Timeout while running gdb traces", file=sys.stderr)
         return 124
 
-    idx, addr_a, addr_b = compare_traces_first_diff(trace_a, trace_b)
-    if idx is None:
-        print("Traces are identical; no differing instruction found.")
+    analysis = analyze_traces(trace_a, trace_b)
+    prev_addr = analysis["prev_addr"]
+    pos = analysis["first_diff_index"]
+    if prev_addr is None:
+        print("Identical traces")
         return 1
 
-    lines_a = trace_a.splitlines()
-    prev_idx = idx - 1
-    if prev_idx >= 0 and prev_idx < len(lines_a):
-        try:
-            prev_addr = int(lines_a[prev_idx], 16)
-        except Exception:
-            prev_addr = None
-
-        if prev_addr is not None:
-            info = get_addr_info(executable, prev_addr)
-            if info is not None:
-                print(format_addr_info(executable, prev_addr))
-            else:
-                print(f"Divergence after 0x{prev_addr:x}, ", end="")
-                print_nearest_debug_info(
-                    executable,
-                    trace_a,
-                    prev_idx,
-                    prev_addr,
-                    mode_label=None,
-                )
-        else:
-            print("<invalid address before divergence>")
+    info = get_addr_info(executable, prev_addr)
+    if info is None:
+        print(f"Divergence after 0x{prev_addr:x}, ", end="")
+        start_idx = (pos - 1) if (pos is not None and pos > 0) else 0
+        print_nearest_debug_info(executable, trace_a, start_idx, prev_addr)
     else:
-        print("<no instruction before divergence>")
+        f, l, c = info
+        print(f"0x{prev_addr:x}: {f}:{l}:{c}")
     return 0
 
 
-def build_parsers_and_dispatch(argv: List[str]) -> int:
-    """Detect mode and dispatch to the appropriate handler.
-
-    If argv[0] is '--', we enter file-based mode where we accept:
-      script.py -- executable --secret-files S --secret-prime-files S' [--public-files P]
-
-    Otherwise, we use the original dataframe mode:
-      script.py input_json klee_output executable --secret S [--public P] [--output OUT]
+def parse_secret_input_spec(spec: str) -> Dict[str, Tuple[int, int, int]]:
     """
-    # Detect leading '--' manually to avoid argparse treating it as option terminator.
-    dashdash_mode = len(argv) > 0 and argv[0] == "--"
-    if dashdash_mode:
-        argv = argv[1:]
+    Parse secret input spec of the form: v1:8=100/200,v2:4=300/400
+    Returns mapping: name -> (size_bytes, orig_value, prime_value)
+    """
+    result: Dict[str, Tuple[int, int, int]] = {}
+    if not spec:
+        return result
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid secret specification '{item}', expected name:bytes=val/val")
+        name_part, vals = item.split("=", 1)
+        name_part = name_part.strip()
+        if ":" not in name_part:
+            raise ValueError(f"Invalid secret specification '{item}', expected name:bytes=val/val")
+        name, size_str = name_part.split(":", 1)
+        name = name.strip()
+        try:
+            size = int(size_str, 0)
+        except ValueError:
+            raise ValueError(f"Invalid byte size in secret specification '{item}'")
+        if size <= 0:
+            raise ValueError(f"Byte size must be positive in secret specification '{item}'")
+        if "/" not in vals:
+            raise ValueError(f"Invalid secret specification '{item}', expected name:bytes=val/val")
+        v1_str, v2_str = vals.split("/", 1)
+        v1 = int(v1_str, 0)
+        v2 = int(v2_str, 0)
+        result[name] = (size, v1, v2)
+    return result
 
-    if dashdash_mode:
-        parser = argparse.ArgumentParser(
-            description=(
-                "Reproduce divergence from explicit input files. Use '--' as the first "
-                "argument to enable this mode."
-            )
+
+def parse_public_input_spec(spec: str) -> Dict[str, Tuple[int, int]]:
+    """
+    Parse public input spec of the form: v3:8=500,v4:4=0x10
+    Returns mapping: name -> (size_bytes, value)
+    """
+    result: Dict[str, Tuple[int, int]] = {}
+    if not spec:
+        return result
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid public specification '{item}', expected name:bytes=val")
+        name_part, v_str = item.split("=", 1)
+        name_part = name_part.strip()
+        if ":" not in name_part:
+            raise ValueError(f"Invalid public specification '{item}', expected name:bytes=val")
+        name, size_str = name_part.split(":", 1)
+        name = name.strip()
+        try:
+            size = int(size_str, 0)
+        except ValueError:
+            raise ValueError(f"Invalid byte size in public specification '{item}'")
+        if size <= 0:
+            raise ValueError(f"Byte size must be positive in public specification '{item}'")
+        val = int(v_str, 0)
+        result[name] = (size, val)
+    return result
+
+
+def write_int_file(path: str, value: int, size: int) -> None:
+    """Write an integer with given byte size (little-endian, signed) to path."""
+    with open(path, "wb") as f:
+        f.write(int(value).to_bytes(size, byteorder="little", signed=True))
+
+
+def mode_input_values(executable: str, secret_spec: str, public_spec: str, timeout: int) -> int:
+    """
+    Mode --input:
+      --secret v1:8=100/200,v2:4=300/400
+      --public v3:8=500
+    Creates temporary files for each variable and runs two traces:
+      A: secrets(orig) + publics
+      B: secrets(prime) + publics
+    """
+    require_tools(["gdb"])
+
+    try:
+        secrets = parse_secret_input_spec(secret_spec)
+        publics = parse_public_input_spec(public_spec)
+    except ValueError as e:
+        print(f"Error parsing inputs: {e}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        files_run_a: List[str] = []
+        files_run_b: List[str] = []
+
+        # Secret variables: create orig and prime files; run A uses name, run B uses name__prime
+        for name, (size, v_orig, v_prime) in secrets.items():
+            path_orig = os.path.join(tmpdir, name)
+            path_prime = os.path.join(tmpdir, f"{name}__prime")
+            write_int_file(path_orig, v_orig, size)
+            write_int_file(path_prime, v_prime, size)
+            files_run_a.append(path_orig)
+            files_run_b.append(path_prime)
+
+        # Public variables: same file for both runs
+        for name, (size, val) in publics.items():
+            path_pub = os.path.join(tmpdir, name)
+            write_int_file(path_pub, val, size)
+            files_run_a.append(path_pub)
+            files_run_b.append(path_pub)
+
+        try:
+            trace_a = run_gdb_trace(executable, files_run_a, timeout)
+            trace_b = run_gdb_trace(executable, files_run_b, timeout)
+        except subprocess.TimeoutExpired:
+            print("Timeout while running gdb traces", file=sys.stderr)
+            return 124
+
+        analysis = analyze_traces(trace_a, trace_b)
+        prev_addr = analysis["prev_addr"]
+        pos = analysis["first_diff_index"]
+
+        if prev_addr is None:
+            print("Identical traces")
+            return 1
+
+        info = get_addr_info(executable, prev_addr)
+        if info is None:
+            print(f"Divergence after 0x{prev_addr:x}, ", end="")
+            start_idx = (pos - 1) if (pos is not None and pos > 0) else 0
+            print_nearest_debug_info(executable, trace_a, start_idx, prev_addr)
+        else:
+            f, l, c = info
+            print(f"0x{prev_addr:x}: {f}:{l}:{c}")
+        return 0
+
+
+def build_parsers_and_dispatch(argv: List[str]) -> int:
+    """CLI with mutually-exclusive modes: --json (batch), --file (.ktest), or --input (manual values)."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Reproduce divergence either from a dataframe (--json), "
+            "a single .ktest (--file), or explicit values (--input)."
         )
-        parser.add_argument("executable", help="Path to the replay executable")
-        parser.add_argument(
-            "--secret-files",
-            required=True,
-            help="Comma-separated list of secret input files (ordered as program expects)",
-        )
-        parser.add_argument(
-            "--secret-prime-files",
-            required=True,
-            help="Comma-separated list of primed secret input files (ordered as program expects)",
-        )
-        parser.add_argument(
-            "--public-files",
-            required=False,
-            default="",
-            help="Comma-separated list of public input files (optional)",
-        )
-        parser.add_argument(
-            "--timeout",
-            required=False,
-            default=60,
-            type=int,
-            help="Maximum time (in seconds) to allow for each replay (default: 60s)",
-        )
-        args = parser.parse_args(argv)
-        return mode_files(
-            executable=args.executable,
-            secret_files=args.secret_files,
-            secret_prime_files=args.secret_prime_files,
-            public_files=args.public_files,
-            timeout=args.timeout,
-        )
-    else:
-        parser = argparse.ArgumentParser(
-            description=(
-                "Extract secret/public inputs from KLEE ktest files and reproduce positives. "
-                "Use '--' as the first argument to switch to direct-file mode."
-            )
-        )
-        parser.add_argument("input_json", help="Path to combined dataframe JSON")
-        parser.add_argument("klee_output", help="Path to KLEE output directory")
-        parser.add_argument("executable", help="Path to the replay executable")
-        parser.add_argument(
-            "--secret",
-            required=True,
-            help="Comma-separated list of secret variable names (required)",
-        )
-        parser.add_argument(
-            "--public",
-            required=False,
-            default="",
-            help="Comma-separated list of public variable names (optional)",
-        )
-        parser.add_argument(
-            "--output",
-            required=False,
-            default=None,
-            help="Path to write output JSON with reproduced column (optional)",
-        )
-        parser.add_argument(
-            "--timeout",
-            required=False,
-            default=60,
-            type=int,
-            help="Maximum time (in seconds) to allow for each replay (default: 60s)",
-        )
-        args = parser.parse_args(argv)
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--json",
+        dest="json_path",
+        help="Path to combined dataframe JSON (batch mode).",
+    )
+    group.add_argument(
+        "--file",
+        dest="ktest_file",
+        help="Path to a single KLEE .ktest file (e.g., branch_counterexample_<id>.ktest).",
+    )
+    group.add_argument(
+        "--input",
+        dest="input_mode",
+        action="store_true",
+        help=(
+            "Manually supply inputs on the command line: "
+            "--secret v1:8=100/200,v2:4=300/400 --public v3:8=500"
+        ),
+    )
+    parser.add_argument(
+        "--klee-output",
+        dest="klee_output",
+        help="Path to KLEE output directory (required with --json).",
+    )
+    parser.add_argument(
+        "--executable",
+        required=True,
+        help="Path to the replay executable.",
+    )
+    parser.add_argument(
+        "--secret",
+        required=True,
+        help=(
+            "In --json/--file modes: comma-separated secret variable names.\n"
+            "In --input mode: comma-separated name:bytes=orig/prime (e.g., v1:8=100/200)."
+        ),
+    )
+    parser.add_argument(
+        "--public",
+        required=False,
+        default="",
+        help=(
+            "In --json/--file modes: comma-separated public variable names.\n"
+            "In --input mode: comma-separated name:bytes=value (e.g., v3:8=500)."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        required=False,
+        default=None,
+        help="Path to write output JSON with reproduced column (only with --json).",
+    )
+    parser.add_argument(
+        "--timeout",
+        required=False,
+        default=60,
+        type=int,
+        help="Maximum time (in seconds) to allow for each replay (default: 60s).",
+    )
+    args = parser.parse_args(argv)
+
+    if args.json_path:
+        if not args.klee_output:
+            parser.error("--klee-output is required when using --json")
         mode_dataframe(
-            input_json=args.input_json,
+            input_json=args.json_path,
             klee_output=args.klee_output,
             executable=args.executable,
             secret=args.secret,
@@ -378,6 +457,23 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
             output=args.output,
         )
         return 0
+
+    if args.ktest_file:
+        return mode_ktest_file(
+            executable=args.executable,
+            ktest_file=args.ktest_file,
+            secret=args.secret,
+            public=args.public,
+            timeout=args.timeout,
+        )
+
+    # --input mode
+    return mode_input_values(
+        executable=args.executable,
+        secret_spec=args.secret,
+        public_spec=args.public,
+        timeout=args.timeout,
+    )
 
 
 def main():

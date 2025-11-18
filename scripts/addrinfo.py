@@ -2,51 +2,84 @@
 
 import argparse
 from elftools.elf.elffile import ELFFile
+import os
+from typing import Optional, Tuple, Dict, Any
+import bisect
 
-def get_addr_info(executable_path, address):
+# Per-executable cache: exe -> preprocessed DWARF lookup data
+_ADDR_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def get_addr_info(exe: str, address: int) -> Optional[Tuple[str, int, int]]:
     """
-    Finds the source file, line, and column for a given instruction address
-    in an ELF executable compiled with DWARF debug information.
-
-    Args:
-        executable_path (str): The path to the executable file.
-        address (int): The instruction address to look up.
-
-    Returns:
-        A tuple (filename, line, column) if the address is found,
-        otherwise None.
+    Resolve address to (file, line, col) similar to addr2dbg.py but with caching:
+    - Build a mapping addr -> (path, line, col) once per exe.
+    - On each query, binary-search nearest previous address like addr2line.
     """
-    best_match = None
 
-    with open(executable_path, 'rb') as f:
-        elffile = ELFFile(f)
+    # Build cache on first use
+    if exe not in _ADDR_CACHE:
+        with open(exe, "rb") as stream:
+            elffile = ELFFile(stream)
+            if not elffile.has_dwarf_info():
+                _ADDR_CACHE[exe] = {"has_dwarf": False}
+                return None
+            dwarfinfo = elffile.get_dwarf_info()
 
-        if not elffile.has_dwarf_info():
-            print(f"Warning: No DWARF info found in '{executable_path}'.")
-            print("Please compile the executable with the '-g' flag (e.g., 'gcc -g my_program.c -o my_program').")
-            return None
+            # Helper: build full path from CU top DIE (DW_AT_name + DW_AT_comp_dir)
+            def cu_full_path(cu) -> Optional[str]:
+                top = cu.get_top_DIE()
+                name_attr = top.attributes.get("DW_AT_name")
+                if not name_attr:
+                    return None
+                name = name_attr.value
+                if isinstance(name, bytes):
+                    name = name.decode("utf-8", "replace")
+                if os.path.isabs(name):
+                    return os.path.normpath(name)
+                comp_dir_attr = top.attributes.get("DW_AT_comp_dir")
+                if comp_dir_attr:
+                    comp_dir = comp_dir_attr.value
+                    if isinstance(comp_dir, bytes):
+                        comp_dir = comp_dir.decode("utf-8", "replace")
+                    return os.path.normpath(os.path.join(comp_dir, name))
+                return os.path.normpath(name)
 
-        dwarfinfo = elffile.get_dwarf_info()
+            # addr -> (path, line, col)
+            addr_map: Dict[int, Tuple[str, int, int]] = {}
 
-        # Iterate over all Compilation Units (CUs) in the DWARF information.
-        # Each CU typically corresponds to one source file.
-        for cu in dwarfinfo.iter_CUs():
-            # Get the line program, which maps addresses to source code lines.
-            line_program = dwarfinfo.line_program_for_CU(cu)
-
-            # Get the full filenames for this CU. The line program entries
-            # only contain an index into this list.
-            cu_filenames = [entry.name.decode('utf-8') for entry in line_program['file_entry']]
-
-            for entry in line_program.get_entries():
-                if entry.state is None:
+            for cu in dwarfinfo.iter_CUs():
+                cu_path = cu_full_path(cu)
+                if cu_path is None:
                     continue
+                line_prog = dwarfinfo.line_program_for_CU(cu)
+                if line_prog is None:
+                    continue
+                for entry in line_prog.get_entries():
+                    state = entry.state
+                    if state is None:
+                        continue
+                    addr_map[state.address] = (cu_path, state.line, state.column)
 
-                if entry.state.address == address:
-                    # The file index in DWARF is 1-based, so we subtract 1.
-                    return cu_filenames[entry.state.file - 1], entry.state.line, entry.state.column
+            _ADDR_CACHE[exe] = {
+                "has_dwarf": True,
+                "addr_map": addr_map,
+            }
 
-    return None
+    cache = _ADDR_CACHE[exe]
+    if not cache.get("has_dwarf"):
+        return None
+
+    addr_map: Dict[int, Tuple[str, int, int]] = cache["addr_map"]
+    if not addr_map:
+        return None
+
+    # Nearest-previous address (addr2line behavior)
+    addrs = sorted(addr_map.keys())
+    idx = bisect.bisect_right(addrs, address) - 1
+    if idx < 0:
+        return None
+    return addr_map[addrs[idx]]
 
 
 if __name__ == '__main__':
@@ -71,14 +104,11 @@ if __name__ == '__main__':
         print(f"Error: Invalid address format. Please use a hexadecimal string like '0x123abc'.")
         exit(1)
 
-    # Call the main function with the provided arguments.
     info = get_addr_info(args.executable_path, address_int)
 
     if info:
         filename, line, column = info
-        # Print the result in a standard format.
         print(f"{filename}:{line}:{column}")
     else:
         print(f"Could not find debug info for address {args.address} in '{args.executable_path}'.")
-        # Exit with a non-zero status to indicate that the lookup failed.
         exit(1)
