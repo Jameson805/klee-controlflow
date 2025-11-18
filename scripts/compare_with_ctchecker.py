@@ -5,6 +5,9 @@ import numpy as np
 import argparse
 import os
 import json
+import subprocess
+import sys
+import shutil
 
 from common import save_combined_json
 
@@ -21,7 +24,18 @@ parser.add_argument(
     default="",
     help="If set, keep only KLEE rows whose filename starts with this prefix and strip the prefix from the filename (e.g., 'crypto/bn' makes 'crypto/bn/bn_exp.c' -> 'bn_exp.c')."
 )
+parser.add_argument("--secret", default="", help="Comma-separated list of secret variable names (e.g., key)")
+parser.add_argument("--public", default="", help="Comma-separated list of public variable names (e.g., length,nonce)")
 args = parser.parse_args()
+
+def parse_list(s: str):
+    return [p.strip() for p in s.split(",") if p and p.strip()]
+
+def require_tools(tools):
+    missing = [t for t in tools if shutil.which(t) is None]
+    if missing:
+        print(f"Error: required tools not found on PATH: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(2)
 
 def load_ctchecker(ct_type, path):
     with open(path, "r") as f:
@@ -185,6 +199,96 @@ if args.lines:
 
 if args.filename:
     df = df[df["filename"] == args.filename]
+
+def extract_counterexamples(df: pd.DataFrame, args, secrets, publics):
+    """
+    For rows with non_ct_count > 0 and inst_id present, extract variables
+    from ktest files and store them as integers (machine endian) in df['counterexamples'].
+    """
+    if "counterexamples" not in df.columns:
+        # Create the column with proper length so .at assignments work without KeyError
+        df["counterexamples"] = [None] * len(df)
+
+    require_tools(["ktest-tool"])
+    prefix = "branch" if args.ct_type == "branch" else "memory"
+
+    def int_from_file(path: str):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if not data:
+                return 0
+            return int.from_bytes(data, byteorder=sys.byteorder, signed=False)
+        except FileNotFoundError as e:
+            print(f"[counterexamples] File not found: {path} ({e})", file=sys.stderr)
+            return None
+        except OSError as e:
+            print(f"[counterexamples] OS error reading {path}: {e}", file=sys.stderr)
+            return None
+
+    def extract_var(ktest_file: str, var: str) -> bool:
+        try:
+            subprocess.run(
+                ["ktest-tool", "--extract", var, ktest_file],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"[counterexamples] ktest-tool failed extracting '{var}' from {ktest_file}: {e}", file=sys.stderr)
+            return False
+
+    df["non_ct_count"] = pd.to_numeric(df["non_ct_count"], errors="coerce").fillna(0).astype("int64")
+    if "inst_id" not in df.columns:
+        print("[counterexamples] inst_id column missing; skipping extraction", file=sys.stderr)
+        return df
+
+    mask = (df["non_ct_count"] > 0) & df["inst_id"].notna()
+    for idx, row in df[mask].iterrows():
+        try:
+            inst_id = int(row["inst_id"])
+        except (TypeError, ValueError) as e:
+            print(f"[counterexamples] Invalid inst_id '{row['inst_id']}' at index {idx}: {e}", file=sys.stderr)
+            continue
+
+        ktest_file = os.path.join(args.klee_output, f"{prefix}_counterexample_{inst_id}.ktest")
+        if not os.path.exists(ktest_file):
+            print(f"[counterexamples] Missing ktest file: {ktest_file}", file=sys.stderr)
+            continue
+
+        ce = {}
+        for var in publics:
+            if extract_var(ktest_file, var):
+                val = int_from_file(f"{ktest_file}.{var}")
+                if val is not None:
+                    ce[var] = val
+
+        for var in secrets:
+            if extract_var(ktest_file, var):
+                valb = int_from_file(f"{ktest_file}.{var}")
+                if valb is not None:
+                    ce[var] = valb
+            prime_variants = [f"{var}__prime", f"{var}_prime"]
+            for pv in prime_variants:
+                if extract_var(ktest_file, pv):
+                    valp = int_from_file(f"{ktest_file}.{pv}")
+                    if valp is not None:
+                        ce[pv] = valp
+                    break
+            else:
+                print(f"[counterexamples] Could not extract prime variant for secret '{var}' in {ktest_file}", file=sys.stderr)
+
+        if ce:
+            df.at[idx, "counterexamples"] = ce
+
+    return df
+
+secrets = parse_list(args.secret)
+publics = parse_list(args.public)
+
+if secrets or publics:
+    df = extract_counterexamples(df, args, secrets, publics)
 
 out_dir = os.path.dirname(args.output_path)
 if out_dir:
