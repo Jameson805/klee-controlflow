@@ -305,9 +305,9 @@ def parse_public_input_spec(spec: str) -> Dict[str, Tuple[int, int]]:
 
 
 def write_int_file(path: str, value: int, size: int) -> None:
-    """Write an integer with given byte size (little-endian, signed) to path."""
+    """Write an integer with given byte size (big-endian, unsigned) to path."""
     with open(path, "wb") as f:
-        f.write(int(value).to_bytes(size, byteorder="little", signed=True))
+        f.write(int(value).to_bytes(size, byteorder="big", signed=False))
 
 
 def mode_input_values(executable: str, secret_spec: str, public_spec: str, timeout: int) -> int:
