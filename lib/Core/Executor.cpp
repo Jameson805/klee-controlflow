@@ -5155,31 +5155,61 @@ void Executor::dumpStates() {
 
 std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
 {
-  if (dyn_cast<ConstantExpr>(e)) return {false, e};
-  if (auto re{dyn_cast<ReadExpr>(e)})
-  {
-    const Array *a{re->updates.root};
-    if (a->isSecret)
+  // Cache to map original expressions to their renamed versions.
+  // This prevents exponential explosion on DAGs.
+  std::map<ref<Expr>, std::pair<bool, ref<Expr>>> visited;
+
+  std::function<std::pair<bool, ref<Expr>>(const ref<Expr>&)> helper;
+  helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
+    if (dyn_cast<ConstantExpr>(expr)) return {false, expr};
+
+    auto it = visited.find(expr);
+    if (it != visited.end()) return it->second;
+
+    std::pair<bool, ref<Expr>> res;
+
+    if (auto re{dyn_cast<ReadExpr>(expr)})
     {
-      auto it = prime.find(a->name);
-      assert(it != prime.end() && "secret symbolic not found in prime map");
-      return {true, ReadExpr::create(UpdateList{it->second, re->updates.head}, re->index)};
+      const Array *a{re->updates.root};
+      if (a->isSecret)
+      {
+        auto itPrime = prime.find(a->name);
+        assert(itPrime != prime.end() && "secret symbolic not found in prime map");
+        res = {true, ReadExpr::create(UpdateList{itPrime->second, re->updates.head}, re->index)};
+      }
+      else
+      {
+        res = {false, expr};
+      }
     }
     else
     {
-        return {false, e};
-    }
-  }
+      bool hasSecret{false};
+      std::vector<ref<Expr>> kids;
+      kids.reserve(expr->getNumKids());
 
-  bool hasSecret{false};
-  std::vector<ref<Expr>> kids;
-  for (unsigned i{0}; i < e->getNumKids(); ++i)
-  {
-    auto [h, k]{renameSecret(e->getKid(i))};
-    hasSecret = (hasSecret || h);
-    kids.push_back(k);
-  }
-  return {hasSecret, e->rebuild(kids.data())};
+      for (unsigned i{0}; i < expr->getNumKids(); ++i)
+      {
+        auto [h, k]{helper(expr->getKid(i))};
+        hasSecret = (hasSecret || h);
+        kids.push_back(k);
+      }
+
+      if (hasSecret)
+      {
+        res = {true, expr->rebuild(kids.data())};
+      }
+      else
+      {
+        res = {false, expr};
+      }
+    }
+
+    visited.insert({expr, res});
+    return res;
+  };
+
+  return helper(e);
 }
 
 bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
@@ -5191,31 +5221,29 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
   if (type == NonCtType::Branch) extendedConstraints = state.constraints;
   ConstraintManager cm{extendedConstraints};
 
-  #define CHECK_ADD(COND) \
-    { \
-      Solver::Validity res; \
-      solver->setTimeout(coreSolverTimeout); \
-      bool success{solver->evaluate(extendedConstraints, COND, res, \
-                                    state.queryMetaData)}; \
-      solver->setTimeout(time::Span()); \
-      if (!success) \
-      { \
-        klee_warning("check condition validity failed"); \
-        ExprPPrinter::printQuery(llvm::errs(), extendedConstraints, \
-                                 ConstantExpr::alloc(0, Expr::Bool)); \
-        return false; \
-      } \
-      if (res == Solver::False) \
-      { \
-        return false; \
-      } \
-      else if (res == Solver::Unknown) \
-      { \
-        cm.addConstraint(COND); \
-      } \
+  {
+    ref<Expr> c{NeExpr::create(cond, renamedCond)};
+    solver->setTimeout(coreSolverTimeout);
+    Solver::Validity res;
+    bool success{solver->evaluate(extendedConstraints, c, res,
+                                  state.queryMetaData)};
+    solver->setTimeout(time::Span());
+    if (!success)
+    {
+      klee_warning("check condition validity failed");
+      ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
+                                ConstantExpr::alloc(0, Expr::Bool));
+      return false;
     }
-
-  CHECK_ADD(NeExpr::create(cond, renamedCond));
+    if (res == Solver::False)
+    {
+      return false;
+    }
+    else if (res == Solver::Unknown)
+    {
+      cm.addConstraint(c);
+    }
+  }
 
   std::vector<const Array*> objects;
   for (const auto &[_, a] : state.symbolics)
