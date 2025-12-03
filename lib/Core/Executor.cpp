@@ -5158,8 +5158,35 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
   // Cache to map original expressions to their renamed versions.
   // This prevents exponential explosion on DAGs.
   std::map<ref<Expr>, std::pair<bool, ref<Expr>>> visited;
+  std::map<const UpdateNode *, std::pair<bool, ref<UpdateNode>>> visitedUpdates;
 
-  std::function<std::pair<bool, ref<Expr>>(const ref<Expr>&)> helper;
+  std::function<std::pair<bool, ref<UpdateNode>>(const ref<UpdateNode> &)> helperUpdates;
+  std::function<std::pair<bool, ref<Expr>>(const ref<Expr> &)> helper;
+
+  helperUpdates = [&](const ref<UpdateNode> &node) -> std::pair<bool, ref<UpdateNode>> {
+    if (!node) return {false, nullptr};
+
+    auto it = visitedUpdates.find(node.get());
+    if (it != visitedUpdates.end()) return it->second;
+
+    auto [nextChanged, newNext] = helperUpdates(node->next);
+    auto [idxChanged, newIdx] = helper(node->index);
+    auto [valChanged, newVal] = helper(node->value);
+
+    std::pair<bool, ref<UpdateNode>> res;
+    if (nextChanged || idxChanged || valChanged)
+    {
+      res = {true, ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})};
+    }
+    else
+    {
+      res = {false, node};
+    }
+
+    visitedUpdates.insert({node.get(), res});
+    return res;
+  };
+
   helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
     if (dyn_cast<ConstantExpr>(expr)) return {false, expr};
 
@@ -5170,12 +5197,29 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
 
     if (auto re{dyn_cast<ReadExpr>(expr)})
     {
-      const Array *a{re->updates.root};
-      if (a->isSecret)
+      // 1. Check if the array root itself is secret
+      const Array *root = re->updates.root;
+      const Array *newRoot = root;
+      bool rootChanged = false;
+
+      if (root->isSecret)
       {
-        auto itPrime = prime.find(a->name);
+        auto itPrime = prime.find(root->name);
         assert(itPrime != prime.end() && "secret symbolic not found in prime map");
-        res = {true, ReadExpr::create(UpdateList{itPrime->second, re->updates.head}, re->index)};
+        newRoot = itPrime->second;
+        rootChanged = true;
+      }
+
+      // 2. Check the index of the read (e.g. A[secret_index])
+      auto [indexChanged, newIndex] = helper(re->index);
+
+      // 3. Check the updates (e.g. A[0] = secret_value)
+      auto [updatesChanged, newHead] = helperUpdates(re->updates.head);
+
+      if (rootChanged || indexChanged || updatesChanged)
+      {
+        UpdateList newUpdates{newRoot, newHead};
+        res = {true, ReadExpr::create(newUpdates, newIndex)};
       }
       else
       {
