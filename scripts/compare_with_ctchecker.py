@@ -24,6 +24,11 @@ parser.add_argument(
     default="",
     help="If set, keep only KLEE rows whose filename starts with this prefix and strip the prefix from the filename (e.g., 'crypto/bn' makes 'crypto/bn/bn_exp.c' -> 'bn_exp.c')."
 )
+parser.add_argument(
+    "--ctchecker-prefix",
+    default="",
+    help="If set, prepend this prefix to every filename in the CtChecker output."
+)
 parser.add_argument("--secret", default="", help="Comma-separated list of secret variable names (e.g., key)")
 parser.add_argument("--public", default="", help="Comma-separated list of public variable names (e.g., length,nonce)")
 args = parser.parse_args()
@@ -37,13 +42,15 @@ def require_tools(tools):
         print(f"Error: required tools not found on PATH: {', '.join(missing)}", file=sys.stderr)
         sys.exit(2)
 
-def load_ctchecker(ct_type, path):
+def load_ctchecker(ct_type, path, prefix=""):
     with open(path, "r") as f:
         data = json.load(f)
     key = "branches" if ct_type == "branch" else "indices"
-    return pd.DataFrame(data.get(key, []))
+    df = pd.DataFrame(data.get(key, []))
+    df["filename"] = df["filename"].apply(lambda x: os.path.join(prefix, x))
+    return df
 
-df_ctchecker = load_ctchecker(args.ct_type, args.ctchecker_output)
+df_ctchecker = load_ctchecker(args.ct_type, args.ctchecker_output, args.ctchecker_prefix)
 
 def load_preaggregated_from_messages(path, tag, code_path_prefix=""):
     """

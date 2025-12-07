@@ -438,9 +438,9 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
     parser.add_argument(
         "--timeout",
         required=False,
-        default=60,
+        default=180,
         type=int,
-        help="Maximum time (in seconds) to allow for each replay (default: 60s).",
+        help="Maximum time (in seconds) to allow for each replay (default: 180s).",
     )
     args = parser.parse_args(argv)
 
