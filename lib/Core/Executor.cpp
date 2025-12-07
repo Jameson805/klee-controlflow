@@ -180,6 +180,11 @@ cl::opt<bool>
                                   "querying the solver (default=true)"),
                          cl::cat(SolvingCat));
 
+cl::opt<bool> ConcretizeOnSolverTimeout(
+    "concretize-on-solver-timeout", cl::init(true),
+    cl::desc("Concretize public inputs on solver timeout (default=true)"),
+    cl::cat(SolvingCat));
+
 
 /*** External call policy options ***/
 
@@ -1057,68 +1062,81 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   ConstraintSet constraintSet{current.constraints};
 
   if (!success) {
-    {
+    if (ConcretizeOnSolverTimeout) {
+      {
+        Instruction *lastInst;
+        const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
+        if (!ii.file.empty()) {
+          klee_warning("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
+        } else {
+          klee_warning("Query timed out (fork).");
+        }
+      }
+
+      // On timeout, concretize public inputs and re-solve
+      constraintSet = {};
+      ConstraintManager cm{constraintSet};
+
+      std::vector<const Array*> objects;
+      for (unsigned i = 0; i != current.symbolics.size(); ++i)
+        objects.push_back(current.symbolics[i].second);
+      std::vector<std::vector<unsigned char>> values;
+
+      solver->setTimeout(timeout);
+      bool concretizeSuc{solver->getInitialValues(current.constraints, objects, values, current.queryMetaData)};
+      solver->setTimeout(time::Span());
+
+      if (concretizeSuc)
+      {
+        for (unsigned i{0}; i < current.symbolics.size(); ++i)
+        {
+          for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
+          {
+            if (!current.symbolics[i].second->isSecret)
+            {
+              cm.addConstraint(
+                  EqExpr::alloc(
+                    ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
+                      ConstantExpr::alloc(j, current.symbolics[i].second->domain)
+                    ),
+                    ConstantExpr::alloc(values[i][j], Expr::Int8)
+                  )
+              );
+            }
+          }
+
+          solver->setTimeout(timeout);
+          bool resolveSuc{solver->evaluate(constraintSet, condition, res,
+                                          current.queryMetaData)};
+          solver->setTimeout(time::Span());
+          if (!resolveSuc)
+          {
+            current.pc = current.prevPC;
+            // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
+            //                         ConstantExpr::alloc(0, Expr::Bool));
+            terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
+            return StatePair(nullptr, nullptr);
+          }
+        }
+      }
+      else
+      {
+        current.pc = current.prevPC;
+        // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
+        //                         ConstantExpr::alloc(0, Expr::Bool));
+        terminateStateOnSolverError(current, "Failed to concretize fork");
+        return StatePair(nullptr, nullptr);
+      }
+    } else {
       Instruction *lastInst;
       const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
       if (!ii.file.empty()) {
-        klee_warning("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
+        klee_error("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
       } else {
-        klee_warning("Query timed out (fork).");
+        klee_error("Query timed out (fork).");
       }
-    }
-
-    // On timeout, concretize public inputs and re-solve
-    constraintSet = {};
-    ConstraintManager cm{constraintSet};
-
-    std::vector<const Array*> objects;
-    for (unsigned i = 0; i != current.symbolics.size(); ++i)
-      objects.push_back(current.symbolics[i].second);
-    std::vector<std::vector<unsigned char>> values;
-
-    solver->setTimeout(timeout);
-    bool concretizeSuc{solver->getInitialValues(current.constraints, objects, values, current.queryMetaData)};
-    solver->setTimeout(time::Span());
-
-    if (concretizeSuc)
-    {
-      for (unsigned i{0}; i < current.symbolics.size(); ++i)
-      {
-        for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
-        {
-          if (!current.symbolics[i].second->isSecret)
-          {
-            cm.addConstraint(
-                EqExpr::alloc(
-                  ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
-                    ConstantExpr::alloc(j, current.symbolics[i].second->domain)
-                  ),
-                  ConstantExpr::alloc(values[i][j], Expr::Int8)
-                )
-            );
-          }
-        }
-
-        solver->setTimeout(timeout);
-        bool resolveSuc{solver->evaluate(constraintSet, condition, res,
-                                        current.queryMetaData)};
-        solver->setTimeout(time::Span());
-        if (!resolveSuc)
-        {
-          current.pc = current.prevPC;
-          // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
-          //                         ConstantExpr::alloc(0, Expr::Bool));
-          terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
-          return StatePair(nullptr, nullptr);
-        }
-      }
-    }
-    else
-    {
       current.pc = current.prevPC;
-      // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
-      //                         ConstantExpr::alloc(0, Expr::Bool));
-      terminateStateOnSolverError(current, "Failed to concretize fork");
+      terminateStateOnSolverError(current, "Query timed out (fork).");
       return StatePair(nullptr, nullptr);
     }
   }
