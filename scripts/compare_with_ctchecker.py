@@ -225,7 +225,7 @@ def extract_counterexamples(df: pd.DataFrame, args, secrets, publics):
                 data = f.read()
             if not data:
                 return 0
-            return int.from_bytes(data, byteorder=sys.byteorder, signed=False)
+            return int.from_bytes(data, byteorder="big", signed=False)
         except FileNotFoundError as e:
             print(f"[counterexamples] File not found: {path} ({e})", file=sys.stderr)
             return None
