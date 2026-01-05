@@ -1074,8 +1074,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
 
       // On timeout, concretize public inputs and re-solve
-      constraintSet = {};
-      ConstraintManager cm{constraintSet};
+      ConstraintSet csNew;
+      ConstraintManager cm{csNew};
 
       std::vector<const Array*> objects;
       for (unsigned i = 0; i != current.symbolics.size(); ++i)
@@ -1088,6 +1088,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
 
       if (concretizeSuc)
       {
+        // Assign concrete values for public inputs
         for (unsigned i{0}; i < current.symbolics.size(); ++i)
         {
           for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
@@ -1105,14 +1106,39 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
             }
           }
 
+          // Add constraints that are undecided after concretization
+          for (ref<Expr> c : current.constraints)
+          {
+            Solver::Validity v;
+            solver->setTimeout(timeout);
+            bool success{solver->evaluate(csNew, c, v, current.queryMetaData)};
+            solver->setTimeout(time::Span());
+            if (!success)
+            {
+              current.pc = current.prevPC;
+              terminateStateOnSolverError(current, "Failed to evaluate constraint validity");
+              return StatePair(nullptr, nullptr);
+            }
+            if (v == Solver::False)
+            {
+              current.pc = current.prevPC;
+              terminateStateOnSolverError(current, "Concretized values violate path constraints");
+              return StatePair(nullptr, nullptr);
+            }
+            else if (v == Solver::Unknown)
+            {
+              cm.addConstraint(c);
+            }
+          }
+
           solver->setTimeout(timeout);
-          bool resolveSuc{solver->evaluate(constraintSet, condition, res,
+          bool resolveSuc{solver->evaluate(csNew, condition, res,
                                           current.queryMetaData)};
           solver->setTimeout(time::Span());
           if (!resolveSuc)
           {
             current.pc = current.prevPC;
-            // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
+            // ExprPPrinter::printQuery(llvm::errs(), csNew,
             //                         ConstantExpr::alloc(0, Expr::Bool));
             terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
             return StatePair(nullptr, nullptr);
@@ -1122,7 +1148,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       else
       {
         current.pc = current.prevPC;
-        // ExprPPrinter::printQuery(llvm::errs(), constraintSet,
+        // ExprPPrinter::printQuery(llvm::errs(), csNew,
         //                         ConstantExpr::alloc(0, Expr::Bool));
         terminateStateOnSolverError(current, "Failed to concretize fork");
         return StatePair(nullptr, nullptr);
@@ -5279,8 +5305,7 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
   auto [hasSecret, renamedCond]{renameSecret(cond)};
   if (!hasSecret) return false;
 
-  ConstraintSet extendedConstraints;
-  if (type == NonCtType::Branch) extendedConstraints = state.constraints;
+  ConstraintSet extendedConstraints{state.constraints};
   ConstraintManager cm{extendedConstraints};
 
   {
