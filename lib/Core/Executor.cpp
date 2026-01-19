@@ -5318,8 +5318,8 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     if (!success)
     {
       klee_warning("check condition validity failed");
-      ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
-                                ConstantExpr::alloc(0, Expr::Bool));
+      // ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
+      //                           ConstantExpr::alloc(0, Expr::Bool));
       return false;
     }
     if (res == Solver::False)
