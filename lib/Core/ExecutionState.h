@@ -40,6 +40,14 @@ struct InstructionInfo;
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const MemoryMap &mm);
 
+struct Dual {
+  ref<Expr> left;
+  ref<Expr> right;
+
+  Dual() = default;
+  Dual(ref<Expr> l, ref<Expr> r) : left(l), right(r) {}
+};
+
 struct StackFrame {
   KInstIterator caller;
   KFunction *kf;
@@ -47,6 +55,7 @@ struct StackFrame {
 
   std::vector<const MemoryObject *> allocas;
   Cell *locals;
+  Dual *localsDual;
 
   /// Minimum distance to an uncovered instruction once the function
   /// returns. This is not a good place for this but is used to
@@ -180,7 +189,10 @@ public:
   std::uint32_t depth = 0;
 
   /// @brief Address space used by this state (e.g. Global and Heap)
-  AddressSpace addressSpace;
+  AddressSpace addressSpaceLeft;
+
+  /// @brief Right-hand address space used by dual execution
+  AddressSpace addressSpaceRight;
 
   /// @brief Stack allocator (used with deterministic allocation)
   kdalloc::StackAllocator stackAllocator;

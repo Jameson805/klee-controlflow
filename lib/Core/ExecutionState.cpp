@@ -54,6 +54,7 @@ StackFrame::StackFrame(KInstIterator _caller, KFunction *_kf)
   : caller(_caller), kf(_kf), callPathNode(0), 
     minDistToUncoveredOnReturn(0), varargs(0) {
   locals = new Cell[kf->numRegisters];
+  localsDual = new Dual[kf->numRegisters];
 }
 
 StackFrame::StackFrame(const StackFrame &s) 
@@ -64,12 +65,16 @@ StackFrame::StackFrame(const StackFrame &s)
     minDistToUncoveredOnReturn(s.minDistToUncoveredOnReturn),
     varargs(s.varargs) {
   locals = new Cell[s.kf->numRegisters];
+  localsDual = new Dual[s.kf->numRegisters];
   for (unsigned i=0; i<s.kf->numRegisters; i++)
     locals[i] = s.locals[i];
+  for (unsigned i=0; i<s.kf->numRegisters; i++)
+    localsDual[i] = s.localsDual[i];
 }
 
 StackFrame::~StackFrame() { 
   delete[] locals; 
+  delete[] localsDual;
 }
 
 /***/
@@ -98,7 +103,8 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     stack(state.stack),
     incomingBBIndex(state.incomingBBIndex),
     depth(state.depth),
-    addressSpace(state.addressSpace),
+    addressSpaceLeft(state.addressSpaceLeft),
+    addressSpaceRight(state.addressSpaceRight),
     stackAllocator(state.stackAllocator),
     heapAllocator(state.heapAllocator),
     constraints(state.constraints),
@@ -141,7 +147,8 @@ void ExecutionState::popFrame() {
   const StackFrame &sf = stack.back();
   for (const auto *memoryObject : sf.allocas) {
     deallocate(memoryObject);
-    addressSpace.unbindObject(memoryObject);
+    addressSpaceLeft.unbindObject(memoryObject);
+    addressSpaceRight.unbindObject(memoryObject);
   }
   stack.pop_back();
 }
@@ -257,39 +264,52 @@ bool ExecutionState::merge(const ExecutionState &b) {
   // 2. We cannot have free'd any pre-existing object in one state
   // and not the other
 
-  if (DebugLogStateMerge) {
-    llvm::errs() << "\tchecking object states\n";
-    llvm::errs() << "A: " << addressSpace.objects << "\n";
-    llvm::errs() << "B: " << b.addressSpace.objects << "\n";
-  }
-    
-  std::set<const MemoryObject*> mutated;
-  MemoryMap::iterator ai = addressSpace.objects.begin();
-  MemoryMap::iterator bi = b.addressSpace.objects.begin();
-  MemoryMap::iterator ae = addressSpace.objects.end();
-  MemoryMap::iterator be = b.addressSpace.objects.end();
-  for (; ai!=ae && bi!=be; ++ai, ++bi) {
-    if (ai->first != bi->first) {
-      if (DebugLogStateMerge) {
-        if (ai->first < bi->first) {
-          llvm::errs() << "\t\tB misses binding for: " << ai->first->id << "\n";
-        } else {
-          llvm::errs() << "\t\tA misses binding for: " << bi->first->id << "\n";
+  auto checkAndCollectMutated = [&](const AddressSpace &asA,
+                                   const AddressSpace &asB,
+                                   const char *label,
+                                   std::set<const MemoryObject *> &mutated) -> bool {
+    if (DebugLogStateMerge) {
+      llvm::errs() << "\tchecking object states (" << label << ")\n";
+      llvm::errs() << "A: " << asA.objects << "\n";
+      llvm::errs() << "B: " << asB.objects << "\n";
+    }
+
+    MemoryMap::iterator ai = asA.objects.begin();
+    MemoryMap::iterator bi = asB.objects.begin();
+    MemoryMap::iterator ae = asA.objects.end();
+    MemoryMap::iterator be = asB.objects.end();
+    for (; ai != ae && bi != be; ++ai, ++bi) {
+      if (ai->first != bi->first) {
+        if (DebugLogStateMerge) {
+          if (ai->first < bi->first) {
+            llvm::errs() << "\t\tB misses binding for: " << ai->first->id << "\n";
+          } else {
+            llvm::errs() << "\t\tA misses binding for: " << bi->first->id << "\n";
+          }
         }
+        return false;
       }
+      if (ai->second.get() != bi->second.get()) {
+        if (DebugLogStateMerge)
+          llvm::errs() << "\t\tmutated: " << ai->first->id << "\n";
+        mutated.insert(ai->first);
+      }
+    }
+    if (ai != ae || bi != be) {
+      if (DebugLogStateMerge)
+        llvm::errs() << "\t\tmappings differ\n";
       return false;
     }
-    if (ai->second.get() != bi->second.get()) {
-      if (DebugLogStateMerge)
-        llvm::errs() << "\t\tmutated: " << ai->first->id << "\n";
-      mutated.insert(ai->first);
-    }
-  }
-  if (ai!=ae || bi!=be) {
-    if (DebugLogStateMerge)
-      llvm::errs() << "\t\tmappings differ\n";
+    return true;
+  };
+
+  std::set<const MemoryObject *> mutatedLeft;
+  if (!checkAndCollectMutated(addressSpaceLeft, b.addressSpaceLeft, "left", mutatedLeft))
     return false;
-  }
+
+  std::set<const MemoryObject *> mutatedRight;
+  if (!checkAndCollectMutated(addressSpaceRight, b.addressSpaceRight, "right", mutatedRight))
+    return false;
   
   // merge stack
 
@@ -323,22 +343,28 @@ bool ExecutionState::merge(const ExecutionState &b) {
     }
   }
 
-  for (std::set<const MemoryObject*>::iterator it = mutated.begin(), 
-         ie = mutated.end(); it != ie; ++it) {
-    const MemoryObject *mo = *it;
-    const ObjectState *os = addressSpace.findObject(mo);
-    const ObjectState *otherOS = b.addressSpace.findObject(mo);
-    assert(os && !os->readOnly && 
-           "objects mutated but not writable in merging state");
-    assert(otherOS);
+  auto mergeMutatedObjects = [&](AddressSpace &asA,
+                                 const AddressSpace &asB,
+                                 const std::set<const MemoryObject *> &mutated) {
+    for (auto it = mutated.begin(), ie = mutated.end(); it != ie; ++it) {
+      const MemoryObject *mo = *it;
+      const ObjectState *os = asA.findObject(mo);
+      const ObjectState *otherOS = asB.findObject(mo);
+      assert(os && !os->readOnly &&
+             "objects mutated but not writable in merging state");
+      assert(otherOS);
 
-    ObjectState *wos = addressSpace.getWriteable(mo, os);
-    for (unsigned i=0; i<mo->size; i++) {
-      ref<Expr> av = wos->read8(i);
-      ref<Expr> bv = otherOS->read8(i);
-      wos->write(i, SelectExpr::create(inA, av, bv));
+      ObjectState *wos = asA.getWriteable(mo, os);
+      for (unsigned i = 0; i < mo->size; i++) {
+        ref<Expr> av = wos->read8(i);
+        ref<Expr> bv = otherOS->read8(i);
+        wos->write(i, SelectExpr::create(inA, av, bv));
+      }
     }
-  }
+  };
+
+  mergeMutatedObjects(addressSpaceLeft, b.addressSpaceLeft, mutatedLeft);
+  mergeMutatedObjects(addressSpaceRight, b.addressSpaceRight, mutatedRight);
 
   constraints = ConstraintSet();
 

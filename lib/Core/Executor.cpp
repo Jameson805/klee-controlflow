@@ -87,12 +87,14 @@
 #include <cstdint>
 #include <cstring>
 #include <cxxabi.h>
+#include <functional>
 #include <fstream>
 #include <iomanip>
 #include <iosfwd>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <vector>
@@ -156,6 +158,11 @@ cl::opt<bool> EmitAllErrors(
              "(default=false, i.e. one per (error,instruction) pair)"),
     cl::cat(TestGenCat));
 
+cl::opt<bool> ProductProgramFallback(
+  "product-program-fallback", cl::init(false),
+  cl::desc("Enable bindLocal() Dual fallback/repair for product-program execution "
+    "(default=false). When disabled, bindLocal() only binds the scalar value."),
+  cl::cat(MiscCat));
 
 /* Constraint solving options */
 
@@ -179,11 +186,6 @@ cl::opt<bool>
                          cl::desc("Simplify equality expressions before "
                                   "querying the solver (default=true)"),
                          cl::cat(SolvingCat));
-
-cl::opt<bool> ConcretizeOnSolverTimeout(
-    "concretize-on-solver-timeout", cl::init(true),
-    cl::desc("Concretize public inputs on solver timeout (default=true)"),
-    cl::cat(SolvingCat));
 
 
 /*** External call policy options ***/
@@ -847,7 +849,7 @@ void Executor::initializeGlobalObjects(ExecutionState &state) {
 
   for (const GlobalVariable &v : m->globals()) {
     MemoryObject *mo = globalObjects.find(&v)->second;
-    ObjectState *os = bindObjectInState(state, mo, false);
+    auto [osLeft, osRight] = bindObjectInStateDual(state, mo, false);
 
     if (v.isDeclaration() && mo->size) {
       // Program already running -> object already initialized.
@@ -863,17 +865,25 @@ void Executor::initializeGlobalObjects(ExecutionState &state) {
                    static_cast<int>(v.getName().size()), v.getName().data());
       }
       for (unsigned offset = 0; offset < mo->size; offset++) {
-        os->write8(offset, static_cast<unsigned char *>(addr)[offset]);
+        osLeft->write8(offset, static_cast<unsigned char *>(addr)[offset]);
+        osRight->write8(offset, static_cast<unsigned char *>(addr)[offset]);
       }
     } else if (v.hasInitializer()) {
-      initializeGlobalObject(state, os, v.getInitializer(), 0);
+      initializeGlobalObject(state, osLeft, v.getInitializer(), 0);
+      initializeGlobalObject(state, osRight, v.getInitializer(), 0);
       if (v.isConstant()) {
-        os->setReadOnly(true);
+        osLeft->setReadOnly(true);
+        osRight->setReadOnly(true);
         // initialise constant memory that may be used with external calls
-        state.addressSpace.copyOutConcrete(mo, os);
+        state.addressSpaceLeft.copyOutConcrete(mo, osLeft);
+        state.addressSpaceRight.copyOutConcrete(mo, osRight);
       }
     } else {
-      os->initializeToRandom();
+      // Keep product-program worlds in lockstep: same uninitialized bytes.
+      osLeft->initializeToRandom();
+      for (unsigned offset = 0; offset < mo->size; offset++) {
+        osRight->write(offset, osLeft->read8(offset));
+      }
     }
   }
 }
@@ -1062,109 +1072,16 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   ConstraintSet constraintSet{current.constraints};
 
   if (!success) {
-    if (ConcretizeOnSolverTimeout) {
-      {
-        Instruction *lastInst;
-        const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
-        if (!ii.file.empty()) {
-          klee_warning("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
-        } else {
-          klee_warning("Query timed out (fork).");
-        }
-      }
-
-      // On timeout, concretize public inputs and re-solve
-      ConstraintSet csNew;
-      ConstraintManager cm{csNew};
-
-      std::vector<const Array*> objects;
-      for (unsigned i = 0; i != current.symbolics.size(); ++i)
-        objects.push_back(current.symbolics[i].second);
-      std::vector<std::vector<unsigned char>> values;
-
-      solver->setTimeout(timeout);
-      bool concretizeSuc{solver->getInitialValues(current.constraints, objects, values, current.queryMetaData)};
-      solver->setTimeout(time::Span());
-
-      if (concretizeSuc)
-      {
-        // Assign concrete values for public inputs
-        for (unsigned i{0}; i < current.symbolics.size(); ++i)
-        {
-          for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
-          {
-            if (!current.symbolics[i].second->isSecret)
-            {
-              cm.addConstraint(
-                  EqExpr::alloc(
-                    ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
-                      ConstantExpr::alloc(j, current.symbolics[i].second->domain)
-                    ),
-                    ConstantExpr::alloc(values[i][j], Expr::Int8)
-                  )
-              );
-            }
-          }
-
-          // Add constraints that are undecided after concretization
-          for (ref<Expr> c : current.constraints)
-          {
-            Solver::Validity v;
-            solver->setTimeout(timeout);
-            bool success{solver->evaluate(csNew, c, v, current.queryMetaData)};
-            solver->setTimeout(time::Span());
-            if (!success)
-            {
-              current.pc = current.prevPC;
-              terminateStateOnSolverError(current, "Failed to evaluate constraint validity");
-              return StatePair(nullptr, nullptr);
-            }
-            if (v == Solver::False)
-            {
-              current.pc = current.prevPC;
-              terminateStateOnSolverError(current, "Concretized values violate path constraints");
-              return StatePair(nullptr, nullptr);
-            }
-            else if (v == Solver::Unknown)
-            {
-              cm.addConstraint(c);
-            }
-          }
-
-          solver->setTimeout(timeout);
-          bool resolveSuc{solver->evaluate(csNew, condition, res,
-                                          current.queryMetaData)};
-          solver->setTimeout(time::Span());
-          if (!resolveSuc)
-          {
-            current.pc = current.prevPC;
-            // ExprPPrinter::printQuery(llvm::errs(), csNew,
-            //                         ConstantExpr::alloc(0, Expr::Bool));
-            terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
-            return StatePair(nullptr, nullptr);
-          }
-        }
-      }
-      else
-      {
-        current.pc = current.prevPC;
-        // ExprPPrinter::printQuery(llvm::errs(), csNew,
-        //                         ConstantExpr::alloc(0, Expr::Bool));
-        terminateStateOnSolverError(current, "Failed to concretize fork");
-        return StatePair(nullptr, nullptr);
-      }
+    Instruction *lastInst;
+    const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
+    if (!ii.file.empty()) {
+      klee_error("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
     } else {
-      Instruction *lastInst;
-      const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
-      if (!ii.file.empty()) {
-        klee_error("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
-      } else {
-        klee_error("Query timed out (fork).");
-      }
-      current.pc = current.prevPC;
-      terminateStateOnSolverError(current, "Query timed out (fork).");
-      return StatePair(nullptr, nullptr);
+      klee_error("Query timed out (fork).");
     }
+    current.pc = current.prevPC;
+    terminateStateOnSolverError(current, "Query timed out (fork).");
+    return StatePair(nullptr, nullptr);
   }
 
   if (!isSeeding) {
@@ -1339,6 +1256,37 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   }
 }
 
+Executor::StatePair Executor::forkDual(ExecutionState &current,
+                                      const Dual &condition,
+                                      bool isInternal, BranchType reason) {
+  ref<Expr> left = condition.left;
+  ref<Expr> right = condition.right;
+  assert(left && right && "forkDual expects a fully-populated Dual condition");
+
+  left = optimizer.optimizeExpr(left, false);
+  right = optimizer.optimizeExpr(right, false);
+
+  // Report divergence and then enforce lockstep (Binsec-style)
+  checkLogCounterexample(NonCtType::Branch, current, NeExpr::create(left, right));
+
+  ref<Expr> lockstep = EqExpr::create(left, right);
+  lockstep = optimizer.optimizeExpr(lockstep, false);
+  if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+    if (!CE->isTrue()) {
+      // No lockstep path exists.
+      terminateStateOnExecError(current,
+        "non-CT branch divergence (no lockstep path)");
+      return StatePair(nullptr, nullptr);
+    }
+    // lockstep is trivially true, no need to add a constraint.
+  } else {
+    addConstraint(current, lockstep);
+  }
+
+  // Fork on the left condition; equality enforces same decision on the right.
+  return fork(current, left, isInternal, reason);
+}
+
 void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(condition)) {
     if (!CE->isTrue())
@@ -1369,9 +1317,59 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   }
 
   state.addConstraint(condition);
-  // NEW: Duplicate constraint with secret symbolics replaced with primes
-  auto [hasSecret, renamedCond]{renameSecret(condition)};
-  if (hasSecret) state.addConstraint(renamedCond);
+
+  // FIXME: Necessary to ensure correctness before every constraint added to
+  // left world are mirrored to right world (currently klee_assume don't work).
+  // Duplicate constraint with secret symbolics replaced with primes *only*
+  // if the constraint does not already refer to prime arrays.
+  auto containsPrimeArray = [&](const ref<Expr> &e) -> bool {
+    std::unordered_set<const Expr *> visited;
+    std::unordered_set<const UpdateNode *> visitedUpdates;
+
+    std::function<bool(const ref<UpdateNode> &)> walkUpdates;
+    std::function<bool(const ref<Expr> &)> walk;
+
+    walkUpdates = [&](const ref<UpdateNode> &n) -> bool {
+      if (!n)
+        return false;
+      if (!visitedUpdates.insert(n.get()).second)
+        return false;
+      if (walkUpdates(n->next))
+        return true;
+      if (walk(n->index))
+        return true;
+      return walk(n->value);
+    };
+
+    walk = [&](const ref<Expr> &x) -> bool {
+      if (!x)
+        return false;
+      if (!visited.insert(x.get()).second)
+        return false;
+      if (auto re = dyn_cast<ReadExpr>(x)) {
+        const Array *root = re->updates.root;
+        if (root && root->name.size() >= 7 &&
+            root->name.compare(root->name.size() - 7, 7, "__prime") == 0)
+          return true;
+        if (walk(re->index))
+          return true;
+        return walkUpdates(re->updates.head);
+      }
+      for (unsigned i = 0; i < x->getNumKids(); ++i) {
+        if (walk(x->getKid(i)))
+          return true;
+      }
+      return false;
+    };
+
+    return walk(e);
+  };
+
+  if (!containsPrimeArray(condition)) {
+    auto renameRes = renameSecret(condition);
+    if (renameRes.first)
+      state.addConstraint(renameRes.second);
+  }
 
   if (ivcEnabled)
     doImpliedValueConcretization(state, condition, 
@@ -1388,23 +1386,132 @@ const Cell& Executor::eval(KInstruction *ki, unsigned index,
 
   // Determine if this is a constant or not.
   if (vnumber < 0) {
-    unsigned index = -vnumber - 2;
-    return kmodule->constantTable[index];
+    unsigned cindex = -vnumber - 2;
+    return kmodule->constantTable[cindex];
   } else {
-    unsigned index = vnumber;
+    unsigned regIndex = static_cast<unsigned>(vnumber);
     StackFrame &sf = state.stack.back();
-    return sf.locals[index];
+    const Dual &d = sf.localsDual[regIndex];
+    const bool scalarSet = static_cast<bool>(sf.locals[regIndex].value);
+    const bool dualSet = static_cast<bool>(d.left) && static_cast<bool>(d.right);
+    klee_warning_once(reinterpret_cast<void *>(ki->inst),
+                      "product-program: eval() used at %s: opcode %s operand %u -> reg %u (scalar %s, dual %s)",
+                      state.pc->getSourceLocation().c_str(),
+                      ki->inst->getOpcodeName(),
+                      index, regIndex,
+                      scalarSet ? "set" : "UNSET",
+                      dualSet ? "set" : "UNSET");
+    return sf.locals[regIndex];
   }
+}
+
+Dual Executor::evalDual(KInstruction *ki, unsigned index,
+                        ExecutionState &state) const {
+  assert(index < ki->inst->getNumOperands());
+  int vnumber = ki->operands[index];
+
+  assert(vnumber != -1 &&
+         "Invalid operand to evalDual(), not a value or constant!");
+
+  // This is a constant
+  if (vnumber < 0) {
+    unsigned cindex = -vnumber - 2;
+    ref<Expr> v = kmodule->constantTable[cindex].value;
+    return Dual{v, v};
+  }
+
+  unsigned regIndex = static_cast<unsigned>(vnumber);
+  StackFrame &sf = state.stack.back();
+  return sf.localsDual[regIndex];
 }
 
 void Executor::bindLocal(KInstruction *target, ExecutionState &state, 
                          ref<Expr> value) {
+  if (!ProductProgramFallback)
+    return;
+
   getDestCell(state, target).value = value;
+
+  if (!value)
+    return;
+
+  // Product-program baseline: if an instruction produces a scalar value but we
+  // didn't compute its Dual value, conservatively synthesize one by renaming
+  // secret reads. This also provides a systematic warning for not-yet-dualized
+  // instructions.
+  Dual &dstDual = getDestCellDual(state, target);
+  auto renameRes = renameSecret(value);
+  Dual expected{value, renameRes.second};
+
+  // If the destination Dual cell is unset, or appears to still contain an old
+  // Dual value from a previous assignment to the same register, re-synchronize
+  // it to match the scalar value.
+  if (!dstDual.left || !dstDual.right) {
+    klee_warning_once(reinterpret_cast<void *>(target->inst),
+                      "instruction has no Dual semantics at %s: opcode %s; using renameSecret fallback",
+                      state.pc->getSourceLocation().c_str(),
+                      target->inst->getOpcodeName());
+    dstDual = expected;
+    return;
+  }
+
+  {
+    ref<Expr> mismatch = NeExpr::create(dstDual.left, expected.left);
+    mismatch = ConstraintManager::simplifyExpr(state.constraints, mismatch);
+    solver->setTimeout(coreSolverTimeout);
+    bool mismatchPossible;
+    bool ok = solver->mayBeTrue(state.constraints, mismatch, mismatchPossible,
+                                state.queryMetaData);
+    assert(ok && "Solver failed");
+    solver->setTimeout(time::Span());
+    if (mismatchPossible) {
+      klee_warning("Dual.left out of sync at %s: opcode %s; repairing left",
+                    state.pc->getSourceLocation().c_str(),
+                    target->inst->getOpcodeName());
+      dstDual.left = expected.left;
+    }
+  }
+
+  {
+    ref<Expr> mismatch = NeExpr::create(dstDual.right, expected.right);
+    mismatch = ConstraintManager::simplifyExpr(state.constraints, mismatch);
+    solver->setTimeout(coreSolverTimeout);
+    bool mismatchPossible;
+    bool ok = solver->mayBeTrue(state.constraints, mismatch, mismatchPossible,
+                                state.queryMetaData);
+    assert(ok && "Solver failed");
+    solver->setTimeout(time::Span());
+    if (mismatchPossible) {
+      klee_warning("Dual.right out of sync at %s: opcode %s; repairing via renameSecret",
+                    state.pc->getSourceLocation().c_str(),
+                    target->inst->getOpcodeName());
+      dstDual.right = expected.right;
+    }
+  }
+}
+
+void Executor::bindLocalDual(KInstruction *target, ExecutionState &state,
+                             Dual value) {
+  getDestCellDual(state, target) = value;
 }
 
 void Executor::bindArgument(KFunction *kf, unsigned index, 
                             ExecutionState &state, ref<Expr> value) {
   getArgumentCell(state, kf, index).value = value;
+
+  if (!value)
+    return;
+
+  Dual &dstDual = getArgumentCellDual(state, kf, index);
+  if (!dstDual.left || !dstDual.right) {
+    auto renameRes = renameSecret(value);
+    dstDual = Dual{value, renameRes.second};
+  }
+}
+
+void Executor::bindArgumentDual(KFunction *kf, unsigned index,
+                                ExecutionState &state, Dual value) {
+  getArgumentCellDual(state, kf, index) = value;
 }
 
 ref<Expr> Executor::toUnique(const ExecutionState &state, 
@@ -1490,6 +1597,9 @@ void Executor::executeGetValue(ExecutionState &state,
         solver->getValue(state.constraints, e, value, state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
+    // Product-program: get_value returns a concrete value; keep both worlds
+    // identical to avoid "no Dual semantics (call)" warnings at callers.
+    bindLocalDual(target, state, Dual{value, value});
     bindLocal(target, state, value);
   } else {
     std::set< ref<Expr> > values;
@@ -1517,8 +1627,10 @@ void Executor::executeGetValue(ExecutionState &state,
     for (std::set< ref<Expr> >::iterator vit = values.begin(), 
            vie = values.end(); vit != vie; ++vit) {
       ExecutionState *es = *bit;
-      if (es)
+      if (es) {
+        bindLocalDual(target, *es, Dual{*vit, *vit});
         bindLocal(target, *es, *vit);
+      }
       ++bit;
     }
   }
@@ -2150,21 +2262,30 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
               0, "While allocating varargs: malloc did not align to 16 bytes.");
         }
 
-        ObjectState *os = bindObjectInState(state, mo, true);
+        auto [osLeft, osRight] = bindObjectInStateDual(state, mo, true);
 
         for (unsigned k = funcArgs; k < callingArgs; k++) {
           if (!cb.isByValArgument(k)) {
-            os->write(offsets[k], arguments[k]);
+            osLeft->write(offsets[k], arguments[k]);
+            osRight->write(offsets[k], arguments[k]);
           } else {
             ConstantExpr *CE = dyn_cast<ConstantExpr>(arguments[k]);
             assert(CE); // byval argument needs to be a concrete pointer
 
             ObjectPair op;
-            state.addressSpace.resolveOne(CE, op);
+            state.addressSpaceLeft.resolveOne(CE, op);
             const ObjectState *osarg = op.second;
             assert(osarg);
-            for (unsigned i = 0; i < osarg->size; i++)
-              os->write(offsets[k] + i, osarg->read8(i));
+
+            ObjectPair opRight;
+            state.addressSpaceRight.resolveOne(CE, opRight);
+            const ObjectState *osargRight = opRight.second;
+            assert(osargRight);
+
+            for (unsigned i = 0; i < osarg->size; i++) {
+              osLeft->write(offsets[k] + i, osarg->read8(i));
+              osRight->write(offsets[k] + i, osargRight->read8(i));
+            }
           }
         }
       }
@@ -2173,6 +2294,458 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
     unsigned numFormals = f->arg_size();
     for (unsigned k = 0; k < numFormals; k++)
       bindArgument(kf, k, state, arguments[k]);
+  }
+}
+
+void Executor::executeCallDual(ExecutionState &state, KInstruction *ki,
+                              Function *f,
+                              const std::vector<Dual> &argumentsDual) {
+  std::vector<ref<Expr>> argumentsLeft;
+  std::vector<ref<Expr>> argumentsRight;
+  argumentsLeft.reserve(argumentsDual.size());
+  argumentsRight.reserve(argumentsDual.size());
+  for (const Dual &d : argumentsDual) {
+    assert(d.left && d.right &&
+           "executeCallDual expects fully-populated Dual arguments");
+    argumentsLeft.push_back(d.left);
+    argumentsRight.push_back(d.right);
+  }
+
+  Instruction *i = ki->inst;
+  if (isa_and_nonnull<DbgInfoIntrinsic>(i))
+    return;
+
+  if (f && f->isDeclaration()) {
+    switch (f->getIntrinsicID()) {
+    case Intrinsic::not_intrinsic: {
+      // External-call arguments must be identical across worlds.
+      if (!argumentsLeft.empty()) {
+        ref<Expr> diverge = ConstantExpr::alloc(0, Expr::Bool);
+        for (size_t idx = 0; idx < argumentsLeft.size(); ++idx)
+          diverge = OrExpr::create(diverge,
+                                  NeExpr::create(argumentsLeft[idx],
+                                                argumentsRight[idx]));
+        checkLogCounterexample(NonCtType::Branch, state, diverge);
+
+        for (size_t idx = 0; idx < argumentsLeft.size(); ++idx) {
+          ref<Expr> lockstep =
+              EqExpr::create(argumentsLeft[idx], argumentsRight[idx]);
+          lockstep = optimizer.optimizeExpr(lockstep, false);
+          if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+            if (!CE->isTrue()) {
+              terminateStateOnExecError(
+                  state, "non-CT external call argument divergence");
+              break;
+            }
+          } else {
+            addConstraint(state, lockstep);
+          }
+        }
+      }
+
+      // state may be destroyed by this call, cannot touch
+      std::vector<ref<Expr>> argsTmp = argumentsLeft;
+      callExternalFunction(state, ki, kmodule->functionMap[f], argsTmp);
+      break;
+    }
+    case Intrinsic::fabs: {
+      ref<ConstantExpr> argL =
+          toConstant(state, argumentsLeft[0], "floating point");
+      ref<ConstantExpr> argR =
+          toConstant(state, argumentsRight[0], "floating point");
+      if (!fpWidthToSemantics(argL->getWidth()) ||
+          !fpWidthToSemantics(argR->getWidth()))
+        return terminateStateOnExecError(
+            state, "Unsupported intrinsic llvm.fabs call");
+
+      llvm::APFloat resL(*fpWidthToSemantics(argL->getWidth()),
+                         argL->getAPValue());
+      llvm::APFloat resR(*fpWidthToSemantics(argR->getWidth()),
+                         argR->getAPValue());
+      resL = llvm::abs(resL);
+      resR = llvm::abs(resR);
+
+      Dual out{ConstantExpr::alloc(resL.bitcastToAPInt()),
+               ConstantExpr::alloc(resR.bitcastToAPInt())};
+      bindLocalDual(ki, state, out);
+      bindLocal(ki, state, out.left);
+      break;
+    }
+
+    case Intrinsic::fma:
+    case Intrinsic::fmuladd: {
+      if (isa<VectorType>(i->getOperand(0)->getType()))
+        return terminateStateOnExecError(
+            state, f->getName() + " with vectors is not supported");
+
+      ref<ConstantExpr> op1L =
+          toConstant(state, argumentsLeft[0], "floating point");
+      ref<ConstantExpr> op2L =
+          toConstant(state, argumentsLeft[1], "floating point");
+      ref<ConstantExpr> op3L =
+          toConstant(state, argumentsLeft[2], "floating point");
+
+      ref<ConstantExpr> op1R =
+          toConstant(state, argumentsRight[0], "floating point");
+      ref<ConstantExpr> op2R =
+          toConstant(state, argumentsRight[1], "floating point");
+      ref<ConstantExpr> op3R =
+          toConstant(state, argumentsRight[2], "floating point");
+
+      if (!fpWidthToSemantics(op1L->getWidth()) ||
+          !fpWidthToSemantics(op2L->getWidth()) ||
+          !fpWidthToSemantics(op3L->getWidth()) ||
+          !fpWidthToSemantics(op1R->getWidth()) ||
+          !fpWidthToSemantics(op2R->getWidth()) ||
+          !fpWidthToSemantics(op3R->getWidth()))
+        return terminateStateOnExecError(
+            state, "Unsupported " + f->getName() + " call");
+
+      APFloat resL(*fpWidthToSemantics(op1L->getWidth()), op1L->getAPValue());
+      resL.fusedMultiplyAdd(
+          APFloat(*fpWidthToSemantics(op2L->getWidth()), op2L->getAPValue()),
+          APFloat(*fpWidthToSemantics(op3L->getWidth()), op3L->getAPValue()),
+          APFloat::rmNearestTiesToEven);
+
+      APFloat resR(*fpWidthToSemantics(op1R->getWidth()), op1R->getAPValue());
+      resR.fusedMultiplyAdd(
+          APFloat(*fpWidthToSemantics(op2R->getWidth()), op2R->getAPValue()),
+          APFloat(*fpWidthToSemantics(op3R->getWidth()), op3R->getAPValue()),
+          APFloat::rmNearestTiesToEven);
+
+      Dual out{ConstantExpr::alloc(resL.bitcastToAPInt()),
+               ConstantExpr::alloc(resR.bitcastToAPInt())};
+      bindLocalDual(ki, state, out);
+      bindLocal(ki, state, out.left);
+      break;
+    }
+
+#if LLVM_VERSION_CODE >= LLVM_VERSION(12, 0)
+    case Intrinsic::abs: {
+      if (isa<VectorType>(i->getOperand(0)->getType()))
+        return terminateStateOnExecError(
+            state, "llvm.abs with vectors is not supported");
+
+      ref<Expr> opL = argumentsLeft[0];
+      ref<Expr> poisonL = argumentsLeft[1];
+      ref<Expr> opR = argumentsRight[0];
+      ref<Expr> poisonR = argumentsRight[1];
+
+      assert(poisonL->getWidth() == 1 && "Second argument is not an i1");
+      assert(poisonR->getWidth() == 1 && "Second argument is not an i1");
+      unsigned bw = opL->getWidth();
+
+      uint64_t moneVal = APInt(bw, -1, true).getZExtValue();
+      uint64_t sminVal = APInt::getSignedMinValue(bw).getZExtValue();
+
+      ref<ConstantExpr> zero = ConstantExpr::create(0, bw);
+      ref<ConstantExpr> mone = ConstantExpr::create(moneVal, bw);
+      ref<ConstantExpr> smin = ConstantExpr::create(sminVal, bw);
+
+      if (poisonL->isTrue()) {
+        ref<Expr> issmin = EqExpr::create(opL, smin);
+        if (issmin->isTrue())
+          return terminateStateOnExecError(
+              state, "llvm.abs called with poison and INT_MIN");
+      }
+      if (poisonR->isTrue()) {
+        ref<Expr> issmin = EqExpr::create(opR, smin);
+        if (issmin->isTrue())
+          return terminateStateOnExecError(
+              state, "llvm.abs called with poison and INT_MIN");
+      }
+
+      ref<Expr> negativeL = SltExpr::create(opL, zero);
+      ref<Expr> notsminL = NeExpr::create(opL, smin);
+      ref<Expr> condL = AndExpr::create(negativeL, notsminL);
+      ref<Expr> flipL = MulExpr::create(opL, mone);
+      ref<Expr> resultL = SelectExpr::create(condL, flipL, opL);
+
+      ref<Expr> negativeR = SltExpr::create(opR, zero);
+      ref<Expr> notsminR = NeExpr::create(opR, smin);
+      ref<Expr> condR = AndExpr::create(negativeR, notsminR);
+      ref<Expr> flipR = MulExpr::create(opR, mone);
+      ref<Expr> resultR = SelectExpr::create(condR, flipR, opR);
+
+      Dual out{resultL, resultR};
+      bindLocalDual(ki, state, out);
+      bindLocal(ki, state, out.left);
+      break;
+    }
+
+    case Intrinsic::smax:
+    case Intrinsic::smin:
+    case Intrinsic::umax:
+    case Intrinsic::umin: {
+      if (isa<VectorType>(i->getOperand(0)->getType()) ||
+          isa<VectorType>(i->getOperand(1)->getType()))
+        return terminateStateOnExecError(
+            state, "llvm.{s,u}{max,min} with vectors is not supported");
+
+      ref<Expr> op1L = argumentsLeft[0];
+      ref<Expr> op2L = argumentsLeft[1];
+      ref<Expr> op1R = argumentsRight[0];
+      ref<Expr> op2R = argumentsRight[1];
+
+      ref<Expr> condL = nullptr;
+      ref<Expr> condR = nullptr;
+      if (f->getIntrinsicID() == Intrinsic::smax) {
+        condL = SgtExpr::create(op1L, op2L);
+        condR = SgtExpr::create(op1R, op2R);
+      } else if (f->getIntrinsicID() == Intrinsic::smin) {
+        condL = SltExpr::create(op1L, op2L);
+        condR = SltExpr::create(op1R, op2R);
+      } else if (f->getIntrinsicID() == Intrinsic::umax) {
+        condL = UgtExpr::create(op1L, op2L);
+        condR = UgtExpr::create(op1R, op2R);
+      } else {
+        condL = UltExpr::create(op1L, op2L);
+        condR = UltExpr::create(op1R, op2R);
+      }
+
+      ref<Expr> resultL = SelectExpr::create(condL, op1L, op2L);
+      ref<Expr> resultR = SelectExpr::create(condR, op1R, op2R);
+      Dual out{resultL, resultR};
+      bindLocalDual(ki, state, out);
+      bindLocal(ki, state, out.left);
+      break;
+    }
+#endif
+
+    case Intrinsic::fshr:
+    case Intrinsic::fshl: {
+      ref<Expr> op1L = argumentsLeft[0];
+      ref<Expr> op2L = argumentsLeft[1];
+      ref<Expr> op3L = argumentsLeft[2];
+      ref<Expr> op1R = argumentsRight[0];
+      ref<Expr> op2R = argumentsRight[1];
+      ref<Expr> op3R = argumentsRight[2];
+      unsigned w = op1L->getWidth();
+      assert(w == op2L->getWidth() && "type mismatch");
+      assert(w == op3L->getWidth() && "type mismatch");
+      assert(w == op1R->getWidth() && "type mismatch");
+      assert(w == op2R->getWidth() && "type mismatch");
+      assert(w == op3R->getWidth() && "type mismatch");
+
+      ref<Expr> cL = ConcatExpr::create(op1L, op2L);
+      op3L = URemExpr::create(op3L, ConstantExpr::create(w, w));
+      op3L = ZExtExpr::create(op3L, w + w);
+
+      ref<Expr> cR = ConcatExpr::create(op1R, op2R);
+      op3R = URemExpr::create(op3R, ConstantExpr::create(w, w));
+      op3R = ZExtExpr::create(op3R, w + w);
+
+      if (f->getIntrinsicID() == Intrinsic::fshl) {
+        ref<Expr> sL = ShlExpr::create(cL, op3L);
+        ref<Expr> sR = ShlExpr::create(cR, op3R);
+        Dual out{ExtractExpr::create(sL, w, w), ExtractExpr::create(sR, w, w)};
+        bindLocalDual(ki, state, out);
+        bindLocal(ki, state, out.left);
+      } else {
+        ref<Expr> sL = LShrExpr::create(cL, op3L);
+        ref<Expr> sR = LShrExpr::create(cR, op3R);
+        Dual out{ExtractExpr::create(sL, 0, w), ExtractExpr::create(sR, 0, w)};
+        bindLocalDual(ki, state, out);
+        bindLocal(ki, state, out.left);
+      }
+      break;
+    }
+
+    // va_arg is handled by caller and intrinsic lowering, see comment for
+    // ExecutionState::varargs
+    case Intrinsic::vastart: {
+      StackFrame &sf = state.stack.back();
+      if (!sf.varargs)
+        return;
+
+      Expr::Width WordSize = Context::get().getPointerWidth();
+      if (WordSize == Expr::Int32) {
+        executeMemoryOperationDual(
+            state, true,
+            Dual{argumentsLeft[0], argumentsRight[0]},
+            Dual{sf.varargs->getBaseExpr(), sf.varargs->getBaseExpr()}, 0);
+      } else {
+        assert(WordSize == Expr::Int64 && "Unknown word size!");
+
+        executeMemoryOperationDual(
+            state, true,
+            Dual{argumentsLeft[0], argumentsRight[0]},
+            Dual{ConstantExpr::create(48, 32), ConstantExpr::create(48, 32)},
+            0);
+        executeMemoryOperationDual(
+            state, true,
+            Dual{AddExpr::create(argumentsLeft[0], ConstantExpr::create(4, 64)),
+                 AddExpr::create(argumentsRight[0],
+                                 ConstantExpr::create(4, 64))},
+            Dual{ConstantExpr::create(304, 32), ConstantExpr::create(304, 32)},
+            0);
+        executeMemoryOperationDual(
+            state, true,
+            Dual{AddExpr::create(argumentsLeft[0], ConstantExpr::create(8, 64)),
+                 AddExpr::create(argumentsRight[0],
+                                 ConstantExpr::create(8, 64))},
+            Dual{sf.varargs->getBaseExpr(), sf.varargs->getBaseExpr()}, 0);
+        executeMemoryOperationDual(
+            state, true,
+            Dual{AddExpr::create(argumentsLeft[0],
+                                 ConstantExpr::create(16, 64)),
+                 AddExpr::create(argumentsRight[0],
+                                 ConstantExpr::create(16, 64))},
+            Dual{ConstantExpr::create(0, 64), ConstantExpr::create(0, 64)}, 0);
+      }
+      break;
+    }
+
+#ifdef SUPPORT_KLEE_EH_CXX
+    case Intrinsic::eh_typeid_for: {
+      bindLocal(ki, state, getEhTypeidFor(argumentsLeft.at(0)));
+      break;
+    }
+#endif
+
+    case Intrinsic::vaend:
+      break;
+
+    case Intrinsic::vacopy:
+    default:
+      klee_warning("unimplemented intrinsic: %s", f->getName().data());
+      terminateStateOnExecError(state, "unimplemented intrinsic");
+      return;
+    }
+
+    if (InvokeInst *ii = dyn_cast<InvokeInst>(i)) {
+      transferToBasicBlock(ii->getNormalDest(), i->getParent(), state);
+    }
+  } else {
+    // Check if maximum stack size was reached.
+    if (RuntimeMaxStackFrames && state.stack.size() > RuntimeMaxStackFrames) {
+      terminateStateEarly(state, "Maximum stack size reached.",
+                          StateTerminationType::OutOfStackMemory);
+      klee_warning("Maximum stack size reached.");
+      return;
+    }
+
+    KFunction *kf = kmodule->functionMap[f];
+    state.pushFrame(state.prevPC, kf);
+    state.pc = kf->instructions;
+
+    if (statsTracker)
+      statsTracker->framePushed(state, &state.stack[state.stack.size() - 2]);
+
+    unsigned callingArgs = argumentsLeft.size();
+    unsigned funcArgs = f->arg_size();
+    if (!f->isVarArg()) {
+      if (callingArgs > funcArgs) {
+        klee_warning_once(f, "calling %s with extra arguments.",
+                          f->getName().data());
+      } else if (callingArgs < funcArgs) {
+        terminateStateOnUserError(state,
+                                 "calling function with too few arguments");
+        return;
+      }
+    } else {
+      if (callingArgs < funcArgs) {
+        terminateStateOnUserError(state,
+                                 "calling function with too few arguments");
+        return;
+      }
+
+      Expr::Width WordSize = Context::get().getPointerWidth();
+      assert(((WordSize == Expr::Int32) || (WordSize == Expr::Int64)) &&
+             "Unknown word size!");
+
+      uint64_t size = 0;
+      bool requires16ByteAlignment = false;
+
+      uint64_t offsets[callingArgs];
+      uint64_t argWidth;
+
+      const CallBase &cb = cast<CallBase>(*i);
+      for (unsigned k = funcArgs; k < callingArgs; k++) {
+        if (cb.isByValArgument(k)) {
+          Type *t = cb.getParamByValType(k);
+          argWidth = kmodule->targetData->getTypeSizeInBits(t);
+        } else {
+          argWidth = argumentsLeft[k]->getWidth();
+        }
+
+        MaybeAlign ma = cb.getParamAlign(k);
+        unsigned alignment = ma ? ma->value() : 0;
+
+        if (WordSize == Expr::Int32 && !alignment)
+          alignment = 4;
+        else {
+          if (!alignment && argWidth > Expr::Int64) {
+            alignment = 16;
+            requires16ByteAlignment = true;
+          }
+          if (!alignment)
+            alignment = 8;
+        }
+
+        size = llvm::alignTo(size, alignment);
+        offsets[k] = size;
+
+        if (WordSize == Expr::Int32)
+          size += Expr::getMinBytesForWidth(argWidth);
+        else
+          size += llvm::alignTo(argWidth, WordSize) / 8;
+      }
+
+      StackFrame &sf = state.stack.back();
+      MemoryObject *mo = sf.varargs =
+          memory->allocate(size, true, false, &state, state.prevPC->inst,
+                           (requires16ByteAlignment ? 16 : 8));
+      if (!mo && size) {
+        terminateStateOnExecError(state, "out of memory (varargs)");
+        return;
+      }
+
+      if (mo) {
+        if ((WordSize == Expr::Int64) && (mo->address & 15) &&
+            requires16ByteAlignment) {
+          klee_warning_once(
+              0,
+              "While allocating varargs: malloc did not align to 16 bytes.");
+        }
+
+        auto [osLeft, osRight] = bindObjectInStateDual(state, mo, true);
+
+        for (unsigned k = funcArgs; k < callingArgs; k++) {
+          if (!cb.isByValArgument(k)) {
+            osLeft->write(offsets[k], argumentsLeft[k]);
+            osRight->write(offsets[k], argumentsRight[k]);
+          } else {
+            ConstantExpr *CELeft = dyn_cast<ConstantExpr>(argumentsLeft[k]);
+            ConstantExpr *CERight = dyn_cast<ConstantExpr>(argumentsRight[k]);
+            assert(CELeft && CERight &&
+                   "byval argument needs to be a concrete pointer");
+
+            ObjectPair op;
+            state.addressSpaceLeft.resolveOne(CELeft, op);
+            const ObjectState *osarg = op.second;
+            assert(osarg);
+
+            ObjectPair opRight;
+            state.addressSpaceRight.resolveOne(CERight, opRight);
+            const ObjectState *osargRight = opRight.second;
+            assert(osargRight);
+
+            for (unsigned j = 0; j < osarg->size; j++) {
+              osLeft->write(offsets[k] + j, osarg->read8(j));
+              osRight->write(offsets[k] + j, osargRight->read8(j));
+            }
+          }
+        }
+      }
+    }
+
+    unsigned numFormals = f->arg_size();
+    for (unsigned k = 0; k < numFormals; k++) {
+      bindArgumentDual(kf, k, state,
+                       Dual{argumentsLeft[k], argumentsRight[k]});
+      bindArgument(kf, k, state, argumentsLeft[k]);
+    }
   }
 }
 
@@ -2232,6 +2805,19 @@ Function *Executor::getTargetFunction(Value *calledVal) {
 
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   Instruction *i = ki->inst;
+
+  auto bindLocalWithDual = [&](const Dual &d) {
+    bindLocalDual(ki, state, d);
+    bindLocal(ki, state, d.left);
+  };
+
+  auto dualBinOp = [&](unsigned opIndexA, unsigned opIndexB, auto mk) -> Dual {
+    Dual a = evalDual(ki, opIndexA, state);
+    Dual b = evalDual(ki, opIndexB, state);
+    assert(a.left && a.right && b.left && b.right && "missing Dual operands");
+    return Dual{mk(a.left, b.left), mk(a.right, b.right)};
+  };
+
   switch (i->getOpcode()) {
     // Control flow
   case Instruction::Ret: {
@@ -2239,10 +2825,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     KInstIterator kcaller = state.stack.back().caller;
     Instruction *caller = kcaller ? kcaller->inst : nullptr;
     bool isVoidReturn = (ri->getNumOperands() == 0);
-    ref<Expr> result = ConstantExpr::alloc(0, Expr::Bool);
+    Dual resultDual{ConstantExpr::alloc(0, Expr::Bool),
+                    ConstantExpr::alloc(0, Expr::Bool)};
     
     if (!isVoidReturn) {
-      result = eval(ki, 0, state).value;
+      resultDual = evalDual(ki, 0, state);
     }
     
     if (state.stack.size() <= 1) {
@@ -2272,7 +2859,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                       "search phase unwinding");
 
         // unbind the MO we used to pass the serialized landingpad
-        state.addressSpace.unbindObject(sui->serializedLandingpad);
+        state.addressSpaceLeft.unbindObject(sui->serializedLandingpad);
+        state.addressSpaceRight.unbindObject(sui->serializedLandingpad);
         sui->serializedLandingpad = nullptr;
 
         if (result->isZero()) {
@@ -2301,7 +2889,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         Type *t = caller->getType();
         if (t != Type::getVoidTy(i->getContext())) {
           // may need to do coercion due to bitcasts
-          Expr::Width from = result->getWidth();
+          Expr::Width from = resultDual.left->getWidth();
           Expr::Width to = getWidthForLLVMType(t);
             
           if (from != to) {
@@ -2310,13 +2898,16 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
             // XXX need to check other param attrs ?
             bool isSExt = cb.hasRetAttr(llvm::Attribute::SExt);
             if (isSExt) {
-              result = SExtExpr::create(result, to);
+              resultDual.left = SExtExpr::create(resultDual.left, to);
+              resultDual.right = SExtExpr::create(resultDual.right, to);
             } else {
-              result = ZExtExpr::create(result, to);
+              resultDual.left = ZExtExpr::create(resultDual.left, to);
+              resultDual.right = ZExtExpr::create(resultDual.right, to);
             }
           }
 
-          bindLocal(kcaller, state, result);
+          bindLocalDual(kcaller, state, resultDual);
+          bindLocal(kcaller, state, resultDual.left);
         }
       } else {
         // We check that the return value has no users instead of
@@ -2337,12 +2928,12 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // FIXME: Find a way that we don't have this hidden dependency.
       assert(bi->getCondition() == bi->getOperand(0) &&
              "Wrong operand index!");
-      ref<Expr> cond = eval(ki, 0, state).value;
-      cond = optimizer.optimizeExpr(cond, false);
+      Dual condDual = evalDual(ki, 0, state);
+      condDual.left = optimizer.optimizeExpr(condDual.left, false);
+      condDual.right = optimizer.optimizeExpr(condDual.right, false);
 
-      checkLogCounterexample(NonCtType::Branch, state, ki, cond);
-
-      Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
+        Executor::StatePair branches =
+          forkDual(state, condDual, false, BranchType::Conditional);
 
       // NOTE: There is a hidden dependency here, markBranchVisited
       // requires that we still be in the context of the branch
@@ -2437,7 +3028,25 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   }
   case Instruction::Switch: {
     SwitchInst *si = cast<SwitchInst>(i);
-    ref<Expr> cond = eval(ki, 0, state).value;
+    Dual condDual = evalDual(ki, 0, state);
+
+    // Enforce lockstep on the switch condition
+    checkLogCounterexample(NonCtType::Branch, state,
+                           NeExpr::create(condDual.left, condDual.right));
+    ref<Expr> lockstep = EqExpr::create(condDual.left, condDual.right);
+    lockstep = optimizer.optimizeExpr(lockstep, false);
+    if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+      if (!CE->isTrue()) {
+        terminateStateOnExecError(state,
+                                 "non-CT switch divergence (no lockstep path)");
+        break;
+      }
+      // lockstep is trivially true
+    } else {
+      addConstraint(state, lockstep);
+    }
+
+    ref<Expr> cond = condDual.left;
     BasicBlock *bb = si->getParent();
 
     cond = toUnique(state, cond);
@@ -2573,16 +3182,49 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     Function *f = getTargetFunction(fp);
 
     // evaluate arguments
-    std::vector< ref<Expr> > arguments;
-    arguments.reserve(numArgs);
+    std::vector<Dual> argumentsDual;
+    argumentsDual.reserve(numArgs);
 
-    for (unsigned j=0; j<numArgs; ++j)
-      arguments.push_back(eval(ki, j+1, state).value);
+    for (unsigned j = 0; j < numArgs; ++j) {
+      Dual d = evalDual(ki, j + 1, state);
+      argumentsDual.push_back(d);
+    }
+
+    auto argumentsLeftView = [&]() {
+      std::vector<ref<Expr>> out;
+      out.reserve(argumentsDual.size());
+      for (const auto &d : argumentsDual)
+        out.push_back(d.left);
+      return out;
+    };
 
     if (auto* asmValue = dyn_cast<InlineAsm>(fp)) { //TODO: move to `executeCall`
       if (ExternalCalls != ExternalCallPolicy::None) {
+        // External-call arguments must be identical across worlds.
+        if (!argumentsDual.empty()) {
+          ref<Expr> diverge = ConstantExpr::alloc(0, Expr::Bool);
+          for (const auto &d : argumentsDual)
+            diverge = OrExpr::create(diverge, NeExpr::create(d.left, d.right));
+          checkLogCounterexample(NonCtType::Branch, state, diverge);
+
+          for (const auto &d : argumentsDual) {
+            ref<Expr> lockstep = EqExpr::create(d.left, d.right);
+            lockstep = optimizer.optimizeExpr(lockstep, false);
+            if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+              if (!CE->isTrue()) {
+                terminateStateOnExecError(state,
+                                         "non-CT external call argument divergence");
+                break;
+              }
+            } else {
+              addConstraint(state, lockstep);
+            }
+          }
+        }
+
         KInlineAsm callable(asmValue);
-        callExternalFunction(state, ki, &callable, arguments);
+        auto argsLeft = argumentsLeftView();
+        callExternalFunction(state, ki, &callable, argsLeft);
       } else {
         terminateStateOnExecError(state, "external calls disallowed (in particular inline asm)");
       }
@@ -2605,11 +3247,9 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         // XXX check result coercion
 
         // XXX this really needs thought and validation
-        unsigned i=0;
-        for (std::vector< ref<Expr> >::iterator
-               ai = arguments.begin(), ie = arguments.end();
-             ai != ie; ++ai) {
-          Expr::Width to, from = (*ai)->getWidth();
+        unsigned i = 0;
+        for (auto &argDual : argumentsDual) {
+          Expr::Width to, from = argDual.left->getWidth();
             
           if (i<fType->getNumParams()) {
             to = getWidthForLLVMType(fType->getParamType(i));
@@ -2618,9 +3258,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
               // XXX need to check other param attrs ?
               bool isSExt = cb.paramHasAttr(i, llvm::Attribute::SExt);
               if (isSExt) {
-                arguments[i] = SExtExpr::create(arguments[i], to);
+                argDual.left = SExtExpr::create(argDual.left, to);
+                argDual.right = SExtExpr::create(argDual.right, to);
               } else {
-                arguments[i] = ZExtExpr::create(arguments[i], to);
+                argDual.left = ZExtExpr::create(argDual.left, to);
+                argDual.right = ZExtExpr::create(argDual.right, to);
               }
             }
           }
@@ -2629,9 +3271,26 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         }
       }
 
-      executeCall(state, ki, f, arguments);
+      executeCallDual(state, ki, f, argumentsDual);
     } else {
-      ref<Expr> v = eval(ki, 0, state).value;
+      Dual fpDual = evalDual(ki, 0, state);
+
+      // Enforce lockstep on indirect call targets (Binsec-style).
+      checkLogCounterexample(NonCtType::Branch, state,
+                             NeExpr::create(fpDual.left, fpDual.right));
+      ref<Expr> lockstep = EqExpr::create(fpDual.left, fpDual.right);
+      lockstep = optimizer.optimizeExpr(lockstep, false);
+      if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+        if (!CE->isTrue()) {
+          terminateStateOnExecError(state,
+                                   "non-CT indirect call target divergence");
+          break;
+        }
+      } else {
+        addConstraint(state, lockstep);
+      }
+
+      ref<Expr> v = fpDual.left;
 
       ExecutionState *free = &state;
       bool hasInvalid = false, first = true;
@@ -2659,7 +3318,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                                 "resolved symbolic function pointer to: %s",
                                 f->getName().data());
 
-            executeCall(*res.first, ki, f, arguments);
+            executeCallDual(*res.first, ki, f, argumentsDual);
           } else {
             if (!hasInvalid) {
               terminateStateOnExecError(state, "invalid function pointer");
@@ -2675,19 +3334,23 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     break;
   }
   case Instruction::PHI: {
-    ref<Expr> result = eval(ki, state.incomingBBIndex, state).value;
-    bindLocal(ki, state, result);
+    Dual resultDual = evalDual(ki, state.incomingBBIndex, state);
+    bindLocalDual(ki, state, resultDual);
+    bindLocal(ki, state, resultDual.left);
     break;
   }
 
     // Special instructions
   case Instruction::Select: {
     // NOTE: It is not required that operands 1 and 2 be of scalar type.
-    ref<Expr> cond = eval(ki, 0, state).value;
-    ref<Expr> tExpr = eval(ki, 1, state).value;
-    ref<Expr> fExpr = eval(ki, 2, state).value;
-    ref<Expr> result = SelectExpr::create(cond, tExpr, fExpr);
-    bindLocal(ki, state, result);
+    Dual condDual = evalDual(ki, 0, state);
+    Dual tDual = evalDual(ki, 1, state);
+    Dual fDual = evalDual(ki, 2, state);
+
+    Dual resultDual{SelectExpr::create(condDual.left, tDual.left, fDual.left),
+                    SelectExpr::create(condDual.right, tDual.right, fDual.right)};
+    bindLocalDual(ki, state, resultDual);
+    bindLocal(ki, state, resultDual.left);
     break;
   }
 
@@ -2698,103 +3361,106 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     // Arithmetic / logical
 
   case Instruction::Add: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, AddExpr::create(left, right));
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return AddExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::Sub: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, SubExpr::create(left, right));
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return SubExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
  
   case Instruction::Mul: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, MulExpr::create(left, right));
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return MulExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::UDiv: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = UDivExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return UDivExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::SDiv: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = SDivExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return SDivExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::URem: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = URemExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return URemExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::SRem: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = SRemExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return SRemExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::And: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = AndExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return AndExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::Or: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = OrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return OrExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::Xor: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = XorExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return XorExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::Shl: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = ShlExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return ShlExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::LShr: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = LShrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return LShrExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
   case Instruction::AShr: {
-    ref<Expr> left = eval(ki, 0, state).value;
-    ref<Expr> right = eval(ki, 1, state).value;
-    ref<Expr> result = AShrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    Dual r = dualBinOp(0, 1, [](ref<Expr> l, ref<Expr> r) {
+      return AShrExpr::create(l, r);
+    });
+    bindLocalWithDual(r);
     break;
   }
 
@@ -2804,84 +3470,63 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     CmpInst *ci = cast<CmpInst>(i);
     ICmpInst *ii = cast<ICmpInst>(ci);
 
+    Dual a = evalDual(ki, 0, state);
+    Dual b = evalDual(ki, 1, state);
+    assert(a.left && a.right && b.left && b.right && "missing Dual operands");
+
+    auto bindCmp = [&](ref<Expr> l, ref<Expr> r) {
+      bindLocalDual(ki, state, Dual{l, r});
+      bindLocal(ki, state, l);
+    };
+
     switch(ii->getPredicate()) {
     case ICmpInst::ICMP_EQ: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = EqExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(EqExpr::create(a.left, b.left), EqExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_NE: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = NeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(NeExpr::create(a.left, b.left), NeExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_UGT: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = UgtExpr::create(left, right);
-      bindLocal(ki, state,result);
+      bindCmp(UgtExpr::create(a.left, b.left), UgtExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_UGE: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = UgeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(UgeExpr::create(a.left, b.left), UgeExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_ULT: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = UltExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(UltExpr::create(a.left, b.left), UltExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_ULE: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = UleExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(UleExpr::create(a.left, b.left), UleExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_SGT: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = SgtExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(SgtExpr::create(a.left, b.left), SgtExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_SGE: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = SgeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(SgeExpr::create(a.left, b.left), SgeExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_SLT: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = SltExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(SltExpr::create(a.left, b.left), SltExpr::create(a.right, b.right));
       break;
     }
 
     case ICmpInst::ICMP_SLE: {
-      ref<Expr> left = eval(ki, 0, state).value;
-      ref<Expr> right = eval(ki, 1, state).value;
-      ref<Expr> result = SleExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindCmp(SleExpr::create(a.left, b.left), SleExpr::create(a.right, b.right));
       break;
     }
 
@@ -2896,67 +3541,91 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     AllocaInst *ai = cast<AllocaInst>(i);
     unsigned elementSize = 
       kmodule->targetData->getTypeStoreSize(ai->getAllocatedType());
-    ref<Expr> size = Expr::createPointer(elementSize);
+    ref<Expr> sizeLeft = Expr::createPointer(elementSize);
+    ref<Expr> sizeRight = Expr::createPointer(elementSize);
     if (ai->isArrayAllocation()) {
-      ref<Expr> count = eval(ki, 0, state).value;
-      count = Expr::createZExtToPointerWidth(count);
-      size = MulExpr::create(size, count);
+      Dual countDual = evalDual(ki, 0, state);
+      ref<Expr> countLeft = Expr::createZExtToPointerWidth(countDual.left);
+      ref<Expr> countRight = Expr::createZExtToPointerWidth(countDual.right);
+      sizeLeft = MulExpr::create(sizeLeft, countLeft);
+      sizeRight = MulExpr::create(sizeRight, countRight);
     }
-    executeAlloc(state, size, true, ki);
+
+    // Force allocation sizes equal across worlds.
+    checkLogCounterexample(NonCtType::Memory, state,
+                           NeExpr::create(sizeLeft, sizeRight));
+    ref<Expr> lockstep = EqExpr::create(sizeLeft, sizeRight);
+    lockstep = optimizer.optimizeExpr(lockstep, false);
+    if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+      if (!CE->isTrue()) {
+        terminateStateOnExecError(state,
+                                 "non-CT alloca size divergence (no lockstep path)");
+        break;
+      }
+    } else {
+      addConstraint(state, lockstep);
+    }
+
+    executeAlloc(state, sizeLeft, true, ki);
     break;
   }
 
   case Instruction::Load: {
-    ref<Expr> base = eval(ki, 0, state).value;
-
-    checkLogCounterexample(NonCtType::Memory, state, ki, base);
-
-    executeMemoryOperation(state, false, base, 0, ki);
+    Dual baseDual = evalDual(ki, 0, state);
+    executeMemoryOperationDual(state, false, baseDual, Dual{}, ki);
     break;
   }
   case Instruction::Store: {
-    ref<Expr> base = eval(ki, 1, state).value;
-
-    checkLogCounterexample(NonCtType::Memory, state, ki, base);
-
-    ref<Expr> value = eval(ki, 0, state).value;
-    executeMemoryOperation(state, true, base, value, 0);
+    Dual baseDual = evalDual(ki, 1, state);
+    Dual valueDual = evalDual(ki, 0, state);
+    executeMemoryOperationDual(state, true, baseDual, valueDual, nullptr);
     break;
   }
 
   case Instruction::GetElementPtr: {
     KGEPInstruction *kgepi = static_cast<KGEPInstruction*>(ki);
-    ref<Expr> base = eval(ki, 0, state).value;
-    ref<Expr> original_base = base;
+    Dual baseDual = evalDual(ki, 0, state);
+    assert(baseDual.left && baseDual.right && "missing Dual operand");
+    ref<Expr> baseLeft = baseDual.left;
+    ref<Expr> baseRight = baseDual.right;
+    ref<Expr> original_base = baseLeft;
 
     for (std::vector< std::pair<unsigned, uint64_t> >::iterator 
            it = kgepi->indices.begin(), ie = kgepi->indices.end(); 
          it != ie; ++it) {
       uint64_t elementSize = it->second;
-      ref<Expr> index = eval(ki, it->first, state).value;
-      base = AddExpr::create(base,
-                             MulExpr::create(Expr::createSExtToPointerWidth(index),
-                                             Expr::createPointer(elementSize)));
+      Dual indexDual = evalDual(ki, it->first, state);
+      assert(indexDual.left && indexDual.right && "missing Dual operand");
+      baseLeft = AddExpr::create(
+          baseLeft,
+          MulExpr::create(Expr::createSExtToPointerWidth(indexDual.left),
+                          Expr::createPointer(elementSize)));
+      baseRight = AddExpr::create(
+          baseRight,
+          MulExpr::create(Expr::createSExtToPointerWidth(indexDual.right),
+                          Expr::createPointer(elementSize)));
     }
     if (kgepi->offset)
-      base = AddExpr::create(base,
-                             Expr::createPointer(kgepi->offset));
+      {
+        baseLeft = AddExpr::create(baseLeft, Expr::createPointer(kgepi->offset));
+        baseRight = AddExpr::create(baseRight, Expr::createPointer(kgepi->offset));
+      }
 
     if (SingleObjectResolution) {
-      if (isa<ConstantExpr>(original_base) && !isa<ConstantExpr>(base)) {
+      if (isa<ConstantExpr>(original_base) && !isa<ConstantExpr>(baseLeft)) {
         // the initial base address was a constant expression, the final is not:
         // store the mapping between constant address and the non-const
         // reference in the state
         ref<ConstantExpr> c_orig_base = dyn_cast<ConstantExpr>(original_base);
 
         ObjectPair op;
-        if (state.addressSpace.resolveOne(c_orig_base, op)) {
+        if (state.addressSpaceLeft.resolveOne(c_orig_base, op)) {
           // store the address of the MemoryObject associated with this GEP
           // instruction
-          state.base_mos[op.first->address].insert(base);
+          state.base_mos[op.first->address].insert(baseLeft);
           ref<ConstantExpr> r =
               ConstantExpr::alloc(op.first->address, Expr::Int64);
-          state.base_addrs[base] = r;
+          state.base_addrs[baseLeft] = r;
         } else {
           // this case should not happen - we have a GEP instruction with const
           // base address, so we should be able to find an exact memory object
@@ -2974,59 +3643,70 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           if (refs_it != state.base_mos[address].end()) {
             state.base_mos[address].erase(refs_it);
           }
-          state.base_mos[address].insert(base);
-          state.base_addrs[base] = base_it->second;
+          state.base_mos[address].insert(baseLeft);
+          state.base_addrs[baseLeft] = base_it->second;
           state.base_addrs.erase(base_it->first);
         }
       }
     }
 
-    bindLocal(ki, state, base);
+    bindLocalDual(ki, state, Dual{baseLeft, baseRight});
+    bindLocal(ki, state, baseLeft);
     break;
   }
 
     // Conversion
   case Instruction::Trunc: {
     CastInst *ci = cast<CastInst>(i);
-    ref<Expr> result = ExtractExpr::create(eval(ki, 0, state).value,
-                                           0,
-                                           getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    Dual a = evalDual(ki, 0, state);
+    Expr::Width w = getWidthForLLVMType(ci->getType());
+    Dual r{ExtractExpr::create(a.left, 0, w), ExtractExpr::create(a.right, 0, w)};
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
   case Instruction::ZExt: {
     CastInst *ci = cast<CastInst>(i);
-    ref<Expr> result = ZExtExpr::create(eval(ki, 0, state).value,
-                                        getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    Dual a = evalDual(ki, 0, state);
+    Expr::Width w = getWidthForLLVMType(ci->getType());
+    Dual r{ZExtExpr::create(a.left, w), ZExtExpr::create(a.right, w)};
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
   case Instruction::SExt: {
     CastInst *ci = cast<CastInst>(i);
-    ref<Expr> result = SExtExpr::create(eval(ki, 0, state).value,
-                                        getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    Dual a = evalDual(ki, 0, state);
+    Expr::Width w = getWidthForLLVMType(ci->getType());
+    Dual r{SExtExpr::create(a.left, w), SExtExpr::create(a.right, w)};
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
 
   case Instruction::IntToPtr: {
     CastInst *ci = cast<CastInst>(i);
     Expr::Width pType = getWidthForLLVMType(ci->getType());
-    ref<Expr> arg = eval(ki, 0, state).value;
-    bindLocal(ki, state, ZExtExpr::create(arg, pType));
+    Dual a = evalDual(ki, 0, state);
+    Dual r{ZExtExpr::create(a.left, pType), ZExtExpr::create(a.right, pType)};
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
   case Instruction::PtrToInt: {
     CastInst *ci = cast<CastInst>(i);
     Expr::Width iType = getWidthForLLVMType(ci->getType());
-    ref<Expr> arg = eval(ki, 0, state).value;
-    bindLocal(ki, state, ZExtExpr::create(arg, iType));
+    Dual a = evalDual(ki, 0, state);
+    Dual r{ZExtExpr::create(a.left, iType), ZExtExpr::create(a.right, iType)};
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
 
   case Instruction::BitCast: {
-    ref<Expr> result = eval(ki, 0, state).value;
-    bindLocal(ki, state, result);
+    Dual r = evalDual(ki, 0, state);
+    bindLocalDual(ki, state, r);
+    bindLocal(ki, state, r.left);
     break;
   }
 
@@ -3853,9 +4533,9 @@ std::string Executor::getAddressInfo(ExecutionState &state,
   }
   
   MemoryObject hack((unsigned) example);    
-  MemoryMap::iterator lower = state.addressSpace.objects.upper_bound(&hack);
+  MemoryMap::iterator lower = state.addressSpaceLeft.objects.upper_bound(&hack);
   info << "\tnext: ";
-  if (lower==state.addressSpace.objects.end()) {
+  if (lower==state.addressSpaceLeft.objects.end()) {
     info << "none\n";
   } else {
     const MemoryObject *mo = lower->first;
@@ -3865,10 +4545,10 @@ std::string Executor::getAddressInfo(ExecutionState &state,
          << " of size " << mo->size << "\n"
          << "\t\t" << alloc_info << "\n";
   }
-  if (lower!=state.addressSpace.objects.begin()) {
+  if (lower!=state.addressSpaceLeft.objects.begin()) {
     --lower;
     info << "\tprev: ";
-    if (lower==state.addressSpace.objects.end()) {
+    if (lower==state.addressSpaceLeft.objects.end()) {
       info << "none\n";
     } else {
       const MemoryObject *mo = lower->first;
@@ -4150,8 +4830,8 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
       // according to the selected policy
       if (ObjectPair op;
           cvalue->getWidth() == Context::get().getPointerWidth() &&
-          state.addressSpace.resolveOne(cvalue, op) && !op.second->readOnly) {
-        auto *os = state.addressSpace.getWriteable(op.first, op.second);
+          state.addressSpaceLeft.resolveOne(cvalue, op) && !op.second->readOnly) {
+        auto *os = state.addressSpaceLeft.getWriteable(op.first, op.second);
         os->flushToConcreteStore(*this, state,
                                  ExternalCalls == ExternalCallPolicy::All);
       }
@@ -4189,7 +4869,7 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
     };
 
     auto tmp = minflt();
-    std::size_t neededPages = state.addressSpace.copyOutConcretes();
+    std::size_t neededPages = state.addressSpaceLeft.copyOutConcretes();
     auto newPages = minflt() - tmp;
     assert(newPages >= 0);
     residentPages += newPages;
@@ -4203,14 +4883,14 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
     avgNeededPages_ = (3.0 * avgNeededPages_ + neededPages) / 4.0;
     avgNeededPages = avgNeededPages_;
   } else {
-    state.addressSpace.copyOutConcretes();
+    state.addressSpaceLeft.copyOutConcretes();
   }
 
 #ifndef WINDOWS
   // Update external errno state with local state value
   int *errno_addr = getErrnoLocation(state);
   ObjectPair result;
-  bool resolved = state.addressSpace.resolveOne(
+  bool resolved = state.addressSpaceLeft.resolveOne(
       ConstantExpr::create((uint64_t)errno_addr, Expr::Int64), result);
   if (!resolved)
     klee_error("Could not resolve memory object for errno");
@@ -4227,7 +4907,8 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
       errnoValue->getZExtValue(sizeof(*errno_addr) * 8));
 #endif
 
-  if (ExternalCallWarnings != ExtCallWarnings::None) {
+  if (ExternalCallWarnings != ExtCallWarnings::None &&
+      callable->getName().str() != "syscall") {
     std::string TmpStr;
     llvm::raw_string_ostream os(TmpStr);
     os << "calling external: " << callable->getName().str() << "(";
@@ -4252,9 +4933,16 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
     return;
   }
 
-  if (!state.addressSpace.copyInConcretes(ExternalCalls ==
+  if (!state.addressSpaceLeft.copyInConcretes(ExternalCalls ==
                                           ExternalCallPolicy::All)) {
     terminateStateOnExecError(state, "external modified read-only object",
+                              StateTerminationType::External);
+    return;
+  }
+
+  if (!state.addressSpaceRight.copyInConcretes(ExternalCalls ==
+                                           ExternalCallPolicy::All)) {
+    terminateStateOnExecError(state, "external modified read-only object (right)",
                               StateTerminationType::External);
     return;
   }
@@ -4269,15 +4957,28 @@ void Executor::callExternalFunction(ExecutionState &state, KInstruction *target,
 #ifndef WINDOWS
   // Update errno memory object with the errno value from the call
   int error = externalDispatcher->getLastErrno();
-  state.addressSpace.copyInConcrete(result.first, result.second,
-                                    (uint64_t)&error,
-                                    ExternalCalls == ExternalCallPolicy::All);
+  state.addressSpaceLeft.copyInConcrete(result.first, result.second,
+                                        (uint64_t)&error,
+                                        ExternalCalls == ExternalCallPolicy::All);
+
+  ObjectPair resultRight;
+  bool resolvedRight = state.addressSpaceRight.resolveOne(
+      ConstantExpr::create((uint64_t)errno_addr, Expr::Int64), resultRight);
+  if (!resolvedRight)
+    klee_error("Could not resolve memory object for errno (right)");
+  state.addressSpaceRight.copyInConcrete(resultRight.first, resultRight.second,
+                                         (uint64_t)&error,
+                                         ExternalCalls == ExternalCallPolicy::All);
 #endif
 
   Type *resultType = target->inst->getType();
   if (resultType != Type::getVoidTy(kmodule->module->getContext())) {
     ref<Expr> e =
         ConstantExpr::fromMemory((void *)args, getWidthForLLVMType(resultType));
+    // Product-program: external calls are executed once (using left-world
+    // arguments), but their return value should be available as a Dual.
+    // External return values are concrete here, so keep both sides identical.
+    bindLocalDual(target, state, Dual{e, e});
     bindLocal(target, state, e);
   }
 }
@@ -4315,8 +5016,34 @@ ObjectState *Executor::bindObjectInState(ExecutionState &state,
                                          const MemoryObject *mo,
                                          bool isLocal,
                                          const Array *array) {
-  ObjectState *os = array ? new ObjectState(mo, array) : new ObjectState(mo);
-  state.addressSpace.bindObject(mo, os);
+  auto [osLeft, _] = bindObjectInStateDual(state, mo, isLocal, array, array);
+  return osLeft;
+}
+
+Executor::ObjectStatePair Executor::bindObjectInStateDual(ExecutionState &state,
+                                                         const MemoryObject *mo,
+                                                         bool isLocal,
+                                                         const Array *leftArray,
+                                                         const Array *rightArray) {
+  ObjectState *osLeft = leftArray ? new ObjectState(mo, leftArray)
+                                  : new ObjectState(mo);
+
+  ObjectState *osRight = nullptr;
+  if (rightArray) {
+    osRight = new ObjectState(mo, rightArray);
+  } else if (!leftArray) {
+    // Keep product-program worlds structurally aligned: for ordinary objects
+    // (no explicit symbolic array), ObjectState construction may still create
+    // an internal UpdateList root. Copy-constructing the right state ensures
+    // both sides share the same root and thus reads remain rename-equivalent
+    // under DualSyncStrict.
+    osRight = new ObjectState(*osLeft);
+  } else {
+    osRight = new ObjectState(mo);
+  }
+
+  state.addressSpaceLeft.bindObject(mo, osLeft);
+  state.addressSpaceRight.bindObject(mo, osRight);
 
   // Its possible that multiple bindings of the same mo in the state
   // will put multiple copies on this list, but it doesn't really
@@ -4325,7 +5052,7 @@ ObjectState *Executor::bindObjectInState(ExecutionState &state,
   if (isLocal)
     state.stack.back().allocas.push_back(mo);
 
-  return os;
+  return {osLeft, osRight};
 }
 
 void Executor::executeAlloc(ExecutionState &state,
@@ -4348,21 +5075,35 @@ void Executor::executeAlloc(ExecutionState &state,
       bindLocal(target, state, 
                 ConstantExpr::alloc(0, Context::get().getPointerWidth()));
     } else {
-      ObjectState *os = bindObjectInState(state, mo, isLocal);
+      auto [osLeft, osRight] = bindObjectInStateDual(state, mo, isLocal);
       if (zeroMemory) {
-        os->initializeToZero();
+        osLeft->initializeToZero();
+        osRight->initializeToZero();
       } else {
-        os->initializeToRandom();
+        // Keep product-program worlds in lockstep: same uninitialized bytes.
+        osLeft->initializeToRandom();
+        for (unsigned offset = 0; offset < mo->size; offset++) {
+          osRight->write(offset, osLeft->read8(offset));
+        }
       }
+      bindLocalDual(target, state, Dual{mo->getBaseExpr(), mo->getBaseExpr()});
       bindLocal(target, state, mo->getBaseExpr());
       
       if (reallocFrom) {
-        unsigned count = std::min(reallocFrom->size, os->size);
-        for (unsigned i=0; i<count; i++)
-          os->write(i, reallocFrom->read8(i));
+        unsigned count = std::min(reallocFrom->size, osLeft->size);
         const MemoryObject *reallocObject = reallocFrom->getObject();
+        const ObjectState *reallocFromRight =
+            state.addressSpaceRight.findObject(reallocObject);
+        if (!reallocFromRight)
+          reallocFromRight = reallocFrom;
+
+        for (unsigned i=0; i<count; i++) {
+          osLeft->write(i, reallocFrom->read8(i));
+          osRight->write(i, reallocFromRight->read8(i));
+        }
         state.deallocate(reallocObject);
-        state.addressSpace.unbindObject(reallocObject);
+        state.addressSpaceLeft.unbindObject(reallocObject);
+        state.addressSpaceRight.unbindObject(reallocObject);
       }
     }
   } else {
@@ -4482,7 +5223,8 @@ void Executor::executeFree(ExecutionState &state,
                                      getAddressInfo(*it->second, address));
       } else {
         it->second->deallocate(mo);
-        it->second->addressSpace.unbindObject(mo);
+        it->second->addressSpaceLeft.unbindObject(mo);
+        it->second->addressSpaceRight.unbindObject(mo);
         if (target)
           bindLocal(target, *it->second, Expr::createPointer(0));
       }
@@ -4497,7 +5239,7 @@ void Executor::resolveExact(ExecutionState &state,
   p = optimizer.optimizeExpr(p, true);
   // XXX we may want to be capping this?
   ResolutionList rl;
-  state.addressSpace.resolve(state, solver.get(), p, rl);
+  state.addressSpaceLeft.resolve(state, solver.get(), p, rl);
   
   ExecutionState *unbound = &state;
   for (ResolutionList::iterator it = rl.begin(), ie = rl.end(); 
@@ -4567,7 +5309,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
     if (base_it != state.base_addrs.end()) {
       // Concrete address found in the map, now find the associated memory
       // object
-      if (!state.addressSpace.resolveOne(state, solver.get(), base_it->second, op,
+      if (!state.addressSpaceLeft.resolveOne(state, solver.get(), base_it->second, op,
                                          success) ||
           !success) {
         klee_warning("Failed to resolve concrete address from the base_addrs "
@@ -4586,9 +5328,9 @@ void Executor::executeMemoryOperation(ExecutionState &state,
   }
 
   if (!resolveSingleObject) {
-    if (!state.addressSpace.resolveOne(state, solver.get(), address, op, success)) {
+    if (!state.addressSpaceLeft.resolveOne(state, solver.get(), address, op, success)) {
       address = toConstant(state, address, "resolveOne failure");
-      success = state.addressSpace.resolveOne(cast<ConstantExpr>(address), op);
+      success = state.addressSpaceLeft.resolveOne(cast<ConstantExpr>(address), op);
     }
     solver->setTimeout(time::Span());
 
@@ -4621,7 +5363,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
             terminateStateOnProgramError(state, "memory error: object read only",
                                          StateTerminationType::ReadOnly);
           } else {
-            ObjectState *wos = state.addressSpace.getWriteable(mo, os);
+            ObjectState *wos = state.addressSpaceLeft.getWriteable(mo, os);
             wos->write(offset, value);
           }
         } else {
@@ -4647,7 +5389,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
   if (!resolveSingleObject) {
     solver->setTimeout(coreSolverTimeout);
-    incomplete = state.addressSpace.resolve(state, solver.get(), address, rl, 0,
+    incomplete = state.addressSpaceLeft.resolve(state, solver.get(), address, rl, 0,
                                             coreSolverTimeout);
     solver->setTimeout(time::Span());
   } else {
@@ -4671,7 +5413,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
           terminateStateOnProgramError(*bound, "memory error: object read only",
                                        StateTerminationType::ReadOnly);
         } else {
-          ObjectState *wos = bound->addressSpace.getWriteable(mo, os);
+          ObjectState *wos = bound->addressSpaceLeft.getWriteable(mo, os);
           wos->write(mo->getOffsetExpr(address), value);
         }
       } else {
@@ -4707,7 +5449,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
             auto base = reinterpret_cast<std::uintptr_t>(li.getBaseAddress());
             auto baseExpr = Expr::createPointer(base);
             ObjectPair op;
-            if (!unbound->addressSpace.resolveOne(baseExpr, op)) {
+            if (!unbound->addressSpaceLeft.resolveOne(baseExpr, op)) {
               terminateStateOnProgramError(
                   *unbound, "memory error: use after free",
                   StateTerminationType::Ptr, getAddressInfo(*unbound, address));
@@ -4719,6 +5461,132 @@ void Executor::executeMemoryOperation(ExecutionState &state,
       terminateStateOnProgramError(
           *unbound, "memory error: out of bound pointer",
           StateTerminationType::Ptr, getAddressInfo(*unbound, address));
+    }
+  }
+}
+
+void Executor::executeMemoryOperationDual(ExecutionState &state,
+                                         bool isWrite,
+                                         const Dual &address,
+                                         const Dual &value /* undef if read */,
+                                         KInstruction *target /* undef if write */) {
+  ref<Expr> addressLeft = address.left;
+  ref<Expr> addressRight = address.right;
+  ref<Expr> valueLeft = value.left;
+  ref<Expr> valueRight = value.right;
+
+  assert(addressLeft && addressRight && "executeMemoryOperationDual requires a fully-populated Dual address");
+  assert(addressLeft->getWidth() == addressRight->getWidth() &&
+         "executeMemoryOperationDual expects address widths to match");
+
+  Expr::Width type = 0;
+  if (isWrite) {
+    assert(valueLeft && valueRight && "executeMemoryOperationDual write requires a fully-populated Dual value");
+    type = valueLeft->getWidth();
+  } else {
+    assert(target && "executeMemoryOperationDual read requires a target");
+    type = getWidthForLLVMType(target->inst->getType());
+  }
+  unsigned bytes = Expr::getMinBytesForWidth(type);
+
+  auto simplifyMaybe = [&](ref<Expr> &e) {
+    if (SimplifySymIndices) {
+      if (e && !isa<ConstantExpr>(e))
+        e = ConstraintManager::simplifyExpr(state.constraints, e);
+    }
+    if (e)
+      e = optimizer.optimizeExpr(e, true);
+  };
+
+  simplifyMaybe(addressLeft);
+  simplifyMaybe(addressRight);
+
+  checkLogCounterexample(NonCtType::Memory, state,
+                         NeExpr::create(addressLeft, addressRight));
+
+  ref<Expr> lockstep = EqExpr::create(addressLeft, addressRight);
+  lockstep = optimizer.optimizeExpr(lockstep, false);
+  if (auto *CE = dyn_cast<ConstantExpr>(lockstep)) {
+    if (!CE->isTrue()) {
+      terminateStateOnExecError(state,
+        "non-CT memory divergence (no lockstep path)");
+      return;
+    }
+  } else {
+    addConstraint(state, lockstep);
+  }
+
+  if (isWrite) {
+    simplifyMaybe(valueLeft);
+    simplifyMaybe(valueRight);
+  }
+
+  // Resolve candidate objects on both sides.
+  ResolutionList rlLeft;
+  ResolutionList rlRight;
+  bool incompleteLeft = false;
+  bool incompleteRight = false;
+
+  solver->setTimeout(coreSolverTimeout);
+  incompleteLeft = state.addressSpaceLeft.resolve(state, solver.get(), addressLeft,
+                                                 rlLeft, 0, coreSolverTimeout);
+  incompleteRight = state.addressSpaceRight.resolve(state, solver.get(), addressRight,
+                                                    rlRight, 0, coreSolverTimeout);
+  solver->setTimeout(time::Span());
+
+  ExecutionState *unbound = &state;
+
+  for (auto i = rlLeft.begin(), ie = rlLeft.end(); i != ie; ++i) {
+    const MemoryObject *moLeft = i->first;
+    const ObjectState *osLeft = i->second;
+    ref<Expr> inBoundsLeft = moLeft->getBoundsCheckPointer(addressLeft, bytes);
+
+    for (auto j = rlRight.begin(), je = rlRight.end(); j != je; ++j) {
+      const MemoryObject *moRight = j->first;
+      const ObjectState *osRight = j->second;
+      ref<Expr> inBoundsRight = moRight->getBoundsCheckPointer(addressRight, bytes);
+
+      ref<Expr> inBoth = AndExpr::create(inBoundsLeft, inBoundsRight);
+      StatePair branches = fork(*unbound, inBoth, true, BranchType::MemOp);
+      ExecutionState *bound = branches.first;
+
+      if (bound) {
+        if (isWrite) {
+          if (osLeft->readOnly || osRight->readOnly) {
+            terminateStateOnProgramError(*bound, "memory error: object read only",
+                                         StateTerminationType::ReadOnly);
+          } else {
+            ObjectState *wosLeft = bound->addressSpaceLeft.getWriteable(moLeft, osLeft);
+            ObjectState *wosRight = bound->addressSpaceRight.getWriteable(moRight, osRight);
+            wosLeft->write(moLeft->getOffsetExpr(addressLeft), valueLeft);
+            wosRight->write(moRight->getOffsetExpr(addressRight), valueRight);
+          }
+        } else {
+          ref<Expr> resultLeft = osLeft->read(moLeft->getOffsetExpr(addressLeft), type);
+          ref<Expr> resultRight = osRight->read(moRight->getOffsetExpr(addressRight), type);
+
+          if (interpreterOpts.MakeConcreteSymbolic) {
+            resultLeft = replaceReadWithSymbolic(*bound, resultLeft);
+            resultRight = replaceReadWithSymbolic(*bound, resultRight);
+          }
+          bindLocalDual(target, *bound, Dual{resultLeft, resultRight});
+          bindLocal(target, *bound, resultLeft);
+        }
+      }
+
+      unbound = branches.second;
+      if (!unbound)
+        return;
+    }
+  }
+
+  if (unbound) {
+    if (incompleteLeft || incompleteRight) {
+      terminateStateOnSolverError(*unbound, "Query timed out (resolve). ");
+    } else {
+      terminateStateOnProgramError(
+          *unbound, "memory error: out of bound pointer",
+          StateTerminationType::Ptr, getAddressInfo(*unbound, addressLeft));
     }
   }
 }
@@ -4736,17 +5604,26 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     while (!state.arrayNames.insert(uniqueName).second) {
       uniqueName = name + "_" + llvm::utostr(++id);
     }
-    const Array *array = arrayCache.CreateArray(uniqueName, mo->size, 0, 0, Expr::Int32, Expr::Int8, isSecret);
-    bindObjectInState(state, mo, false, array);
-    state.addSymbolic(mo, array);
 
-    if (array->isSecret)
-    {
-      prime[array->name] = {arrayCache.CreateArray(array->name + "__prime", array->size,
-                            array->constantValues.data(),
-                            array->constantValues.data() + array->constantValues.size(),
-                            array->domain, array->range, array->isSecret)};
+    const Array *arrayLeft = arrayCache.CreateArray(uniqueName, mo->size, 0, 0,
+                                                Expr::Int32, Expr::Int8, isSecret);
+
+    const Array *arrayRight;
+    if (arrayLeft->isSecret) {
+      const Array *primeArray = arrayCache.CreateArray(
+          arrayLeft->name + "__prime", arrayLeft->size, arrayLeft->constantValues.data(),
+          arrayLeft->constantValues.data() + arrayLeft->constantValues.size(), arrayLeft->domain,
+          arrayLeft->range, arrayLeft->isSecret);
+      prime[arrayLeft->name] = primeArray;
+      arrayRight = primeArray;
     }
+    else
+    {
+      arrayRight = arrayLeft;
+    }
+
+    bindObjectInStateDual(state, mo, false, arrayLeft, arrayRight);
+    state.addSymbolic(mo, arrayLeft);
     
     auto found = seedMap.find(&state);
     if (found != seedMap.end()) {
@@ -4757,7 +5634,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
 
         if (!obj) {
           if (AllowSeedExtension) {
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
+            std::vector<unsigned char> &values = si.assignment.bindings[arrayLeft];
             values = std::vector<unsigned char>(mo->size, '\0');
           } else /*if (!AllowSeedExtension)*/ {
             terminateStateOnUserError(state,
@@ -4777,7 +5654,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
             break;
           } else {
             /* Either sizes are equal or seed extension/trucation is allowed */
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
+            std::vector<unsigned char> &values = si.assignment.bindings[arrayLeft];
             values.insert(values.begin(), obj->bytes,
                           obj->bytes + std::min(obj->numBytes, mo->size));
               for (unsigned i = obj->numBytes; i < mo->size; ++i)
@@ -4787,7 +5664,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       }
     }
   } else {
-    ObjectState *os = bindObjectInState(state, mo, false);
+    auto [osLeft, osRight] = bindObjectInStateDual(state, mo, false);
     if (replayPosition >= replayKTest->numObjects) {
       terminateStateOnUserError(state, "replay count mismatch");
     } else {
@@ -4795,8 +5672,10 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       if (obj->numBytes != mo->size) {
         terminateStateOnUserError(state, "replay size mismatch");
       } else {
-        for (unsigned i=0; i<mo->size; i++)
-          os->write8(i, obj->bytes[i]);
+        for (unsigned i=0; i<mo->size; i++) {
+          osLeft->write8(i, obj->bytes[i]);
+          osRight->write8(i, obj->bytes[i]);
+        }
       }
     }
   }
@@ -4869,12 +5748,14 @@ void Executor::runFunctionAsMain(Function *f,
     bindArgument(kf, i, *state, arguments[i]);
 
   if (argvMO) {
-    ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
+    auto [argvOSLeft, argvOSRight] = bindObjectInStateDual(*state, argvMO, false);
 
     for (int i=0; i<argc+1+envc+1+1; i++) {
       if (i==argc || i>=argc+1+envc) {
         // Write NULL pointer
-        argvOS->write(i * NumPtrBytes, Expr::createPointer(0));
+        ref<Expr> nullPtr = Expr::createPointer(0);
+        argvOSLeft->write(i * NumPtrBytes, nullPtr);
+        argvOSRight->write(i * NumPtrBytes, nullPtr);
       } else {
         char *s = i<argc ? argv[i] : envp[i-(argc+1)];
         int j, len = strlen(s);
@@ -4885,12 +5766,17 @@ void Executor::runFunctionAsMain(Function *f,
                              /*alignment=*/8);
         if (!arg)
           klee_error("Could not allocate memory for function arguments");
-        ObjectState *os = bindObjectInState(*state, arg, false);
+        auto [osLeft, osRight] = bindObjectInStateDual(*state, arg, false);
         for (j=0; j<len+1; j++)
-          os->write8(j, s[j]);
+        {
+          osLeft->write8(j, s[j]);
+          osRight->write8(j, s[j]);
+        }
 
         // Write pointer to newly allocated and initialised argv/envp c-string
-        argvOS->write(i * NumPtrBytes, arg->getBaseExpr());
+        ref<Expr> base = arg->getBaseExpr();
+        argvOSLeft->write(i * NumPtrBytes, base);
+        argvOSRight->write(i * NumPtrBytes, base);
       }
     }
   }
@@ -5033,7 +5919,7 @@ void Executor::doImpliedValueConcretization(ExecutionState &state,
       // FIXME: This is the sole remaining usage of the Array object
       // variable. Kill me.
       const MemoryObject *mo = 0; //re->updates.root->object;
-      const ObjectState *os = state.addressSpace.findObject(mo);
+      const ObjectState *os = state.addressSpaceLeft.findObject(mo);
 
       if (!os) {
         // object has been free'd, no need to concretize (although as
@@ -5042,7 +5928,7 @@ void Executor::doImpliedValueConcretization(ExecutionState &state,
       } else {
         assert(!os->readOnly && 
                "not possible? read only object with static read?");
-        ObjectState *wos = state.addressSpace.getWriteable(mo, os);
+        ObjectState *wos = state.addressSpaceLeft.getWriteable(mo, os);
         wos->write(CE, it->second);
       }
     }
@@ -5300,74 +6186,61 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
   return helper(e);
 }
 
-bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
+void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, const ref<Expr> &cond)
 {
-  auto [hasSecret, renamedCond]{renameSecret(cond)};
-  if (!hasSecret) return false;
+  if (!statsTracker)
+    return;
 
-  ConstraintSet extendedConstraints{state.constraints};
-  ConstraintManager cm{extendedConstraints};
+  // IMPORTANT: In Executor::run(), we do:
+  //   KInstruction *ki = state.pc;
+  //   stepInstruction(state); // sets prevPC=pc; ++pc
+  //   executeInstruction(state, ki);
+  // So inside executeInstruction(), state.prevPC is the instruction being
+  // executed, and state.pc is the *next* instruction.
+  KInstruction *ki = state.prevPC;
+  if (!ki)
+    return;
 
-  {
-    ref<Expr> c{NeExpr::create(cond, renamedCond)};
-    solver->setTimeout(coreSolverTimeout);
-    Solver::Validity res;
-    bool success{solver->evaluate(extendedConstraints, c, res,
-                                  state.queryMetaData)};
-    solver->setTimeout(time::Span());
-    if (!success)
-    {
-      klee_warning("check condition validity failed");
-      // ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
-      //                           ConstantExpr::alloc(0, Expr::Bool));
-      return false;
-    }
-    if (res == Solver::False)
-    {
-      return false;
-    }
-    else if (res == Solver::Unknown)
-    {
-      cm.addConstraint(c);
-    }
-  }
-
-  std::vector<const Array*> objects;
-  for (const auto &[_, a] : state.symbolics)
-  {
-    objects.push_back(a);
-    if (a->isSecret)
-    {
-      auto it = prime.find(a->name);
-      assert(it != prime.end() && "secret symbolic not found in prime map");
-      objects.push_back(it->second);
-    }
-  }
-
-  std::vector<std::vector<unsigned char>> values;
+  bool nonCt = false;
   solver->setTimeout(coreSolverTimeout);
-  bool success{solver->getInitialValues(extendedConstraints, objects, values,
-                                        state.queryMetaData)};
+  bool success = solver->mayBeTrue(state.constraints, cond, nonCt,
+                                   state.queryMetaData);
   solver->setTimeout(time::Span());
-  if (!success)
-  {
-    klee_warning("get initial values failed");
-    ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
-                              ConstantExpr::alloc(0, Expr::Bool));
-    return false;
+  if (!success) {
+    klee_warning("check condition satisfiable failed");
+    return;
   }
 
-  for (unsigned i{0}; i < objects.size(); ++i)
-  {
-    assignments.push_back(std::make_pair(objects[i]->name, values[i]));
-  }
-  return true;
-}
-
-void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond)
-{
   Assignments assignments;
-  bool nonCt{getCounterexample(type, assignments, state, cond)};
+  if (nonCt) {
+    ConstraintSet extendedConstraints{state.constraints};
+    ConstraintManager cm{extendedConstraints};
+    cm.addConstraint(cond);
+
+    std::vector<const Array *> objects;
+    for (const auto &[_, a] : state.symbolics) {
+      objects.push_back(a);
+      if (a->isSecret) {
+        auto it = prime.find(a->name);
+        assert(it != prime.end() && "secret symbolic not found in prime map");
+        objects.push_back(it->second);
+      }
+    }
+
+    std::vector<std::vector<unsigned char>> values;
+    solver->setTimeout(coreSolverTimeout);
+    bool ok = solver->getInitialValues(extendedConstraints, objects, values,
+                                       state.queryMetaData);
+    solver->setTimeout(time::Span());
+    if (!ok) {
+      klee_warning("get initial values failed");
+      return;
+    }
+
+    for (unsigned i = 0; i < objects.size(); ++i) {
+      assignments.push_back(std::make_pair(objects[i]->name, values[i]));
+    }
+  }
 
   double time{wallTimer.delta().toSeconds()};
 
@@ -5386,7 +6259,8 @@ void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &stat
     std::string prefix{type == NonCtType::Branch ? "[NON-CT BRANCH]" : "[NON-CT MEMORY]"};
     klee_message((prefix + " %lf : %u : %s : %u : %u").c_str(), time, instId, filename.c_str(), line, col);
     std::string filePrefix{type == NonCtType::Branch ? "branch_counterexample_" : "memory_counterexample_"};
-    writeTestCaseKTest(assignments, filePrefix + std::to_string(instId) + ".ktest");
+    if (nonCt)
+      writeTestCaseKTest(assignments, filePrefix + std::to_string(instId) + ".ktest");
   }
 
   // TODO: Print constraints

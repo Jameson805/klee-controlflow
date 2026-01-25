@@ -221,7 +221,7 @@ SpecialFunctionHandler::readStringAtAddress(ExecutionState &state,
     return "";
   }
   ref<ConstantExpr> address = cast<ConstantExpr>(addressExpr);
-  if (!state.addressSpace.resolveOne(address, op)) {
+  if (!state.addressSpaceLeft.resolveOne(address, op)) {
     executor.terminateStateOnUserError(
         state, "Invalid string pointer passed to one of the klee_ functions");
     return "";
@@ -495,9 +495,10 @@ void SpecialFunctionHandler::handleIsSymbolic(ExecutionState &state,
                                 std::vector<ref<Expr> > &arguments) {
   assert(arguments.size()==1 && "invalid number of arguments to klee_is_symbolic");
 
-  executor.bindLocal(target, state, 
-                     ConstantExpr::create(!isa<ConstantExpr>(arguments[0]),
-                                          Expr::Int32));
+  ref<Expr> res = ConstantExpr::create(!isa<ConstantExpr>(arguments[0]),
+                                       Expr::Int32);
+  executor.bindLocalDual(target, state, Dual{res, res});
+  executor.bindLocal(target, state, res);
 }
 
 void SpecialFunctionHandler::handlePreferCex(ExecutionState &state,
@@ -612,11 +613,11 @@ void SpecialFunctionHandler::handleGetObjSize(ExecutionState &state,
   executor.resolveExact(state, arguments[0], rl, "klee_get_obj_size");
   for (Executor::ExactResolutionList::iterator it = rl.begin(), 
          ie = rl.end(); it != ie; ++it) {
-    executor.bindLocal(
-        target, *it->second,
-        ConstantExpr::create(it->first.first->size,
-                             executor.kmodule->targetData->getTypeSizeInBits(
-                                 target->inst->getType())));
+    ref<Expr> v = ConstantExpr::create(
+      it->first.first->size,
+      executor.kmodule->targetData->getTypeSizeInBits(target->inst->getType()));
+    executor.bindLocalDual(target, *it->second, Dual{v, v});
+    executor.bindLocal(target, *it->second, v);
   }
 }
 
@@ -634,11 +635,22 @@ void SpecialFunctionHandler::handleGetErrno(ExecutionState &state,
 
   // Retrieve the memory object of the errno variable
   ObjectPair result;
-  bool resolved = state.addressSpace.resolveOne(
+  bool resolved = state.addressSpaceLeft.resolveOne(
       ConstantExpr::create((uint64_t)errno_addr, Expr::Int64), result);
   if (!resolved)
     executor.terminateStateOnUserError(state, "Could not resolve address for errno");
-  executor.bindLocal(target, state, result.second->read(0, Expr::Int32));
+
+  ObjectPair resultRight;
+  bool resolvedRight = state.addressSpaceRight.resolveOne(
+      ConstantExpr::create((uint64_t)errno_addr, Expr::Int64), resultRight);
+  if (!resolvedRight)
+    executor.terminateStateOnUserError(state,
+                                      "Could not resolve address for errno (right)");
+
+  ref<Expr> left = result.second->read(0, Expr::Int32);
+  ref<Expr> right = resultRight.second->read(0, Expr::Int32);
+  executor.bindLocalDual(target, state, Dual{left, right});
+  executor.bindLocal(target, state, left);
 }
 
 void SpecialFunctionHandler::handleErrnoLocation(
@@ -654,11 +666,11 @@ void SpecialFunctionHandler::handleErrnoLocation(
   int *errno_addr = nullptr;
 #endif
 
-  executor.bindLocal(
-      target, state,
-      ConstantExpr::create((uint64_t)errno_addr,
-                           executor.kmodule->targetData->getTypeSizeInBits(
-                               target->inst->getType())));
+    ref<Expr> p = ConstantExpr::create(
+      (uint64_t)errno_addr,
+      executor.kmodule->targetData->getTypeSizeInBits(target->inst->getType()));
+    executor.bindLocalDual(target, state, Dual{p, p});
+    executor.bindLocal(target, state, p);
 }
 void SpecialFunctionHandler::handleCalloc(ExecutionState &state,
                             KInstruction *target,
@@ -731,7 +743,7 @@ void SpecialFunctionHandler::handleCheckMemoryAccess(ExecutionState &state,
   } else {
     ObjectPair op;
 
-    if (!state.addressSpace.resolveOne(cast<ConstantExpr>(address), op)) {
+    if (!state.addressSpaceLeft.resolveOne(cast<ConstantExpr>(address), op)) {
       executor.terminateStateOnProgramError(
           state, "check_memory_access: memory error", StateTerminationType::Ptr,
           executor.getAddressInfo(state, address));

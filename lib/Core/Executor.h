@@ -38,6 +38,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct KTest;
@@ -251,6 +252,14 @@ private:
                             KCallable *callable,
                             std::vector< ref<Expr> > &arguments);
 
+  using ObjectStatePair = std::pair<ObjectState *, ObjectState *>;
+
+  ObjectStatePair bindObjectInStateDual(ExecutionState &state,
+                                       const MemoryObject *mo,
+                                       bool isLocal,
+                                       const Array *leftArray = nullptr,
+                                       const Array *rightArray = nullptr);
+
   ObjectState *bindObjectInState(ExecutionState &state, const MemoryObject *mo,
                                  bool isLocal, const Array *array = 0);
 
@@ -319,6 +328,11 @@ private:
                    KInstruction *ki,
                    llvm::Function *f,
                    std::vector< ref<Expr> > &arguments);
+
+  void executeCallDual(ExecutionState &state,
+                       KInstruction *ki,
+                       llvm::Function *f,
+                       const std::vector<Dual> &arguments);
                    
   // do address resolution / object binding / out of bounds checking
   // and perform the operation
@@ -327,6 +341,12 @@ private:
                               ref<Expr> address,
                               ref<Expr> value /* undef if read */,
                               KInstruction *target /* undef if write */);
+
+  void executeMemoryOperationDual(ExecutionState &state,
+                                  bool isWrite,
+                                  const Dual &address,
+                                  const Dual &value /* undef if read */,
+                                  KInstruction *target /* undef if write */);
 
   void executeMakeSymbolic(ExecutionState &state, const MemoryObject *mo,
                            const std::string &name,
@@ -345,6 +365,9 @@ private:
   StatePair fork(ExecutionState &current, ref<Expr> condition, bool isInternal,
                  BranchType reason);
 
+  StatePair forkDual(ExecutionState &current, const Dual &condition,
+                     bool isInternal, BranchType reason);
+
   // If the MaxStatic*Pct limits have been reached, concretize the condition and
   // return it. Otherwise, return the unmodified condition.
   ref<Expr> maxStaticPctChecks(ExecutionState &current, ref<Expr> condition);
@@ -362,10 +385,18 @@ private:
   const Cell& eval(KInstruction *ki, unsigned index, 
                    ExecutionState &state) const;
 
+  Dual evalDual(KInstruction *ki, unsigned index, ExecutionState &state) const;
+
   Cell& getArgumentCell(ExecutionState &state,
                         KFunction *kf,
                         unsigned index) {
     return state.stack.back().locals[kf->getArgRegister(index)];
+  }
+
+  Dual& getArgumentCellDual(ExecutionState &state,
+                            KFunction *kf,
+                            unsigned index) {
+    return state.stack.back().localsDual[kf->getArgRegister(index)];
   }
 
   Cell& getDestCell(ExecutionState &state,
@@ -373,13 +404,23 @@ private:
     return state.stack.back().locals[target->dest];
   }
 
+  Dual& getDestCellDual(ExecutionState &state,
+                        KInstruction *target) {
+    return state.stack.back().localsDual[target->dest];
+  }
+
   void bindLocal(KInstruction *target, 
                  ExecutionState &state, 
                  ref<Expr> value);
+
+  void bindLocalDual(KInstruction *target, ExecutionState &state, Dual value);
   void bindArgument(KFunction *kf, 
                     unsigned index,
                     ExecutionState &state,
                     ref<Expr> value);
+
+  void bindArgumentDual(KFunction *kf, unsigned index, ExecutionState &state,
+                        Dual value);
 
   /// Evaluates an LLVM constant expression.  The optional argument ki
   /// is the instruction where this constant was encountered, or NULL
@@ -524,8 +565,7 @@ private:
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
 
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
-  bool getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
-  void checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond);
+  void checkLogCounterexample(NonCtType type, const ExecutionState &state, const ref<Expr> &cond);
   bool writeTestCaseKTest(const Assignments &out, const std::string &testName);
 
 public:
