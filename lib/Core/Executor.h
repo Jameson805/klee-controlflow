@@ -525,7 +525,7 @@ private:
 
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
   bool getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
-  void checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond);
+  bool checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond);
   bool writeTestCaseKTest(const Assignments &out, const std::string &testName);
 
 public:

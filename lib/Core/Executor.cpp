@@ -2340,7 +2340,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> cond = eval(ki, 0, state).value;
       cond = optimizer.optimizeExpr(cond, false);
 
-      checkLogCounterexample(NonCtType::Branch, state, ki, cond);
+      (void)checkLogCounterexample(NonCtType::Branch, state, ki, cond);
 
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
 
@@ -2909,7 +2909,13 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   case Instruction::Load: {
     ref<Expr> base = eval(ki, 0, state).value;
 
-    checkLogCounterexample(NonCtType::Memory, state, ki, base);
+    bool nonCt = checkLogCounterexample(NonCtType::Memory, state, ki, base);
+    if (nonCt) {
+      auto [hasSecret, renamedBase] = renameSecret(base);
+      if (hasSecret) {
+        state.addConstraint(EqExpr::create(base, renamedBase));
+      }
+    }
 
     executeMemoryOperation(state, false, base, 0, ki);
     break;
@@ -2917,7 +2923,13 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   case Instruction::Store: {
     ref<Expr> base = eval(ki, 1, state).value;
 
-    checkLogCounterexample(NonCtType::Memory, state, ki, base);
+    bool nonCt = checkLogCounterexample(NonCtType::Memory, state, ki, base);
+    if (nonCt) {
+      auto [hasSecret, renamedBase] = renameSecret(base);
+      if (hasSecret) {
+        state.addConstraint(EqExpr::create(base, renamedBase));
+      }
+    }
 
     ref<Expr> value = eval(ki, 0, state).value;
     executeMemoryOperation(state, true, base, value, 0);
@@ -5364,7 +5376,7 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
   return true;
 }
 
-void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond)
+bool Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond)
 {
   Assignments assignments;
   bool nonCt{getCounterexample(type, assignments, state, cond)};
@@ -5422,6 +5434,8 @@ void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &stat
 
   // std::string prefix{type == NonCtType::Branch ? "[BRANCH]" : "[MEMORY]"};
   // klee_message_to_file((prefix + " %s").c_str(), j.dump().c_str());
+
+  return nonCt;
 }
 
 // XXX: Adopted from main.cpp
