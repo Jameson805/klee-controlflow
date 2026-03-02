@@ -5,12 +5,8 @@ import os
 import subprocess
 import sys
 from typing import List, Optional, Tuple, Dict
-
-import pandas as pd
 import shutil
 import tempfile  # new
-
-from common import load_combined_json, save_combined_json
 from addrinfo import get_addr_info
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -153,6 +149,10 @@ def run_traces(executable: str, ktest_file: str, secrets: List[str], publics: Li
 
 def mode_dataframe(input_json: str, klee_output: str, executable: str, secret: str, public: str, timeout: int, output: Optional[str]) -> None:
     """Original mode: iterate rows from a combined JSON and attempt reproduction."""
+    # Lazy imports so --input mode does not require pandas.
+    import pandas as pd  # type: ignore
+    from common import load_combined_json, save_combined_json  # type: ignore
+
     require_tools(["ktest-tool", "gdb"])
 
     secrets = parse_list(secret)
@@ -438,9 +438,9 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
     parser.add_argument(
         "--timeout",
         required=False,
-        default=180,
+        default=300,
         type=int,
-        help="Maximum time (in seconds) to allow for each replay (default: 180s).",
+        help="Maximum time (in seconds) to allow for each replay (default: 300s).",
     )
     args = parser.parse_args(argv)
 
