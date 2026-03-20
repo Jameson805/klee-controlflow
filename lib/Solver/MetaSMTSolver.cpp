@@ -35,6 +35,10 @@
 #include <metaSMT/backend/CVC4.hpp>
 #endif
 
+#ifdef METASMT_HAVE_CVC5
+#include <metaSMT/backend/CVC5.hpp>
+#endif
+
 #ifdef METASMT_HAVE_YICES2
 #include <metaSMT/backend/Yices2.hpp>
 #endif
@@ -450,6 +454,14 @@ std::unique_ptr<Solver> createMetaSMTSolver() {
     backend = "CVC4";
     coreSolver =
         std::make_unique<MetaSMTSolver<DirectSolver_Context<solver::CVC4>>>(
+            UseForkedCoreSolver, CoreSolverOptimizeDivides);
+    break;
+#endif
+#ifdef METASMT_HAVE_CVC5
+  case METASMT_BACKEND_CVC5:
+    backend = "CVC5";
+    coreSolver =
+        std::make_unique<MetaSMTSolver<DirectSolver_Context<solver::CVC5>>>(
             UseForkedCoreSolver, CoreSolverOptimizeDivides);
     break;
 #endif

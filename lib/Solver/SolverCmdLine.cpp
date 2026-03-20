@@ -144,6 +144,9 @@ void KCommandLine::KeepOnlyCategories(
 #elif METASMT_DEFAULT_BACKEND_IS_CVC4
 #define METASMT_DEFAULT_BACKEND_STR "(default = cvc4)."
 #define METASMT_DEFAULT_BACKEND METASMT_BACKEND_CVC4
+#elif METASMT_DEFAULT_BACKEND_IS_CVC5
+#define METASMT_DEFAULT_BACKEND_STR "(default = cvc5)."
+#define METASMT_DEFAULT_BACKEND METASMT_BACKEND_CVC5
 #elif METASMT_DEFAULT_BACKEND_IS_YICES2
 #define METASMT_DEFAULT_BACKEND_STR "(default = yices2)."
 #define METASMT_DEFAULT_BACKEND METASMT_BACKEND_YICES2
@@ -160,6 +163,7 @@ MetaSMTBackend("metasmt-backend",
                           clEnumValN(METASMT_BACKEND_BOOLECTOR, "btor",
                                      "Use metaSMT with Boolector"),
                           clEnumValN(METASMT_BACKEND_CVC4, "cvc4", "Use metaSMT with CVC4"),
+                          clEnumValN(METASMT_BACKEND_CVC5, "cvc5", "Use metaSMT with CVC5"),
                           clEnumValN(METASMT_BACKEND_YICES2, "yices2", "Use metaSMT with Yices2")),
                cl::init(METASMT_DEFAULT_BACKEND),
                cl::cat(SolvingCat));

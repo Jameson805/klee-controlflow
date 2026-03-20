@@ -27,6 +27,9 @@
 #include <metaSMT/frontend/QF_BV.hpp>
 #include <metaSMT/frontend/Array.hpp>
 
+#include <type_traits>
+#include <utility>
+
 using namespace metaSMT;
 using namespace metaSMT::logic::QF_BV;
 
@@ -40,6 +43,21 @@ llvm::cl::opt<bool> UseConstructHashMetaSMT(
 }
 
 namespace klee {
+
+template <typename T, typename = void> struct HasGetBvWidth : std::false_type {};
+
+template <typename T>
+struct HasGetBvWidth<
+    T, std::void_t<decltype(std::declval<T &>().get_bv_width(
+           std::declval<typename T::result_type>()))>> : std::true_type {};
+
+template <typename T>
+inline void assertBVWidthIfSupported(T &solver, typename T::result_type expr,
+                                     unsigned width) {
+  if constexpr (HasGetBvWidth<T>::value) {
+    assert(solver.get_bv_width(expr) == width);
+  }
+}
 
 typedef metaSMT::logic::Predicate<proto::terminal<
     metaSMT::logic::tag::true_tag>::type> const MetaSMTConstTrue;
@@ -543,8 +561,8 @@ MetaSMTBuilder<SolverContext>::bvVarLeftShift(
     typename SolverContext::result_type expr,
     typename SolverContext::result_type shift, unsigned width) {
 
-  assert(_solver.get_bv_width(expr) == width);
-  assert(_solver.get_bv_width(shift) == width);
+  assertBVWidthIfSupported(_solver, expr, width);
+  assertBVWidthIfSupported(_solver, shift, width);
 
   // If overshifting, shift to zero
   return evaluate(_solver,
@@ -560,8 +578,8 @@ MetaSMTBuilder<SolverContext>::bvVarRightShift(
     typename SolverContext::result_type expr,
     typename SolverContext::result_type shift, unsigned width) {
 
-  assert(_solver.get_bv_width(expr) == width);
-  assert(_solver.get_bv_width(shift) == width);
+  assertBVWidthIfSupported(_solver, expr, width);
+  assertBVWidthIfSupported(_solver, shift, width);
 
   // If overshifting, shift to zero
   return evaluate(_solver,
@@ -577,8 +595,8 @@ MetaSMTBuilder<SolverContext>::bvVarArithRightShift(
     typename SolverContext::result_type expr,
     typename SolverContext::result_type shift, unsigned width) {
 
-  assert(_solver.get_bv_width(expr) == width);
-  assert(_solver.get_bv_width(shift) == width);
+  assertBVWidthIfSupported(_solver, expr, width);
+  assertBVWidthIfSupported(_solver, shift, width);
 
   // If overshifting, shift to zero
   return evaluate(_solver,
