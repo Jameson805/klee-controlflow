@@ -47,6 +47,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 DISABLE_WARNING_POP
 
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <unistd.h>
 
@@ -118,6 +119,16 @@ cl::opt<bool> UseCallPaths("use-call-paths", cl::init(true),
                            cl::cat(StatsCat));
 
 } // namespace klee
+
+namespace {
+StatsTracker *activeStatsTracker = nullptr;
+bool nonCtExitHookRegistered = false;
+
+void flushNonCtOnExit() {
+  if (activeStatsTracker)
+    activeStatsTracker->printNonCt();
+}
+} // namespace
 
 ///
 
@@ -294,9 +305,18 @@ StatsTracker::StatsTracker(Executor &_executor, std::string _objectFilename,
       klee_error("Unable to open instruction level stats file (run.istats).");
     }
   }
+
+  activeStatsTracker = this;
+  if (!nonCtExitHookRegistered) {
+    std::atexit(flushNonCtOnExit);
+    nonCtExitHookRegistered = true;
+  }
 }
 
 StatsTracker::~StatsTracker() {  
+  if (activeStatsTracker == this)
+    activeStatsTracker = nullptr;
+
   if (statsFile) {
     auto rc = sqlite3_step(transactionEndStmt);
     if (rc != SQLITE_DONE) {

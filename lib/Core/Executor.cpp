@@ -4507,7 +4507,6 @@ void Executor::run(ExecutionState &initialState) {
   delete searcher;
   searcher = nullptr;
 
-  statsTracker->printNonCt();
   doDumpStates();
 }
 
