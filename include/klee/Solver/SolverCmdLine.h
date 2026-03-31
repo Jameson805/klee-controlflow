@@ -24,6 +24,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/Support/CommandLine.h"
 DISABLE_WARNING_POP
 
+#include <string>
 #include <set>
 
 namespace klee {
@@ -84,6 +85,8 @@ enum MetaSMTBackendType {
 };
 
 extern llvm::cl::opt<klee::MetaSMTBackendType> MetaSMTBackend;
+
+extern llvm::cl::list<std::string> MetaSMTOptions;
 
 #endif /* ENABLE_METASMT */
 

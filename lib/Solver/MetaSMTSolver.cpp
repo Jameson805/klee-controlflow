@@ -15,12 +15,14 @@
 #include "klee/Expr/Assignment.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/ExprUtil.h"
+#include "klee/Solver/SolverCmdLine.h"
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Solver/Solver.h"
 #include "klee/Solver/SolverImpl.h"
 
 #include "llvm/Support/ErrorHandling.h"
 
+#include <metaSMT/API/Options.hpp>
 #include <metaSMT/DirectSolver_Context.hpp>
 
 #ifdef METASMT_HAVE_Z3
@@ -79,6 +81,24 @@ static const unsigned shared_memory_size = 1 << 20;
 
 namespace klee {
 
+namespace {
+
+template <typename SolverContext>
+void applyMetaSMTOptions(SolverContext &solverContext) {
+  for (const auto &option : MetaSMTOptions) {
+    const auto separatorIndex = option.find('=');
+    if (separatorIndex == std::string::npos || separatorIndex == 0) {
+      klee_error("MetaSMT option \"%s\" must have the form key=value",
+                 option.c_str());
+    }
+
+    metaSMT::set_option(solverContext, option.substr(0, separatorIndex),
+                        option.substr(separatorIndex + 1));
+  }
+}
+
+} // namespace
+
 template <typename SolverContext> class MetaSMTSolverImpl : public SolverImpl {
 private:
   SolverContext _meta_solver;
@@ -127,6 +147,8 @@ MetaSMTSolverImpl<SolverContext>::MetaSMTSolverImpl(
       _useForked(useForked) {
   assert(_solver && "unable to create MetaSMTSolver");
   assert(_builder && "unable to create MetaSMTBuilder");
+
+  applyMetaSMTOptions(_meta_solver);
 
   if (_useForked) {
     shared_memory_id =

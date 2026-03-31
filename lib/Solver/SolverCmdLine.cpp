@@ -168,6 +168,12 @@ MetaSMTBackend("metasmt-backend",
                cl::init(METASMT_DEFAULT_BACKEND),
                cl::cat(SolvingCat));
 
+cl::list<std::string> MetaSMTOptions(
+    "metasmt-option",
+    cl::desc("Pass key=value option(s) to the selected MetaSMT backend. "
+             "May be repeated or comma-separated."),
+    cl::CommaSeparated, cl::cat(SolvingCat));
+
 #undef METASMT_DEFAULT_BACKEND
 #undef METASMT_DEFAULT_BACKEND_STR
 
