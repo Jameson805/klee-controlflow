@@ -231,7 +231,7 @@ def mode_ktest_file(executable: str, ktest_file: str, secret: str, public: str, 
     if info is None:
         print(f"Divergence after 0x{prev_addr:x}, ", end="")
         start_idx = (pos - 1) if (pos is not None and pos > 0) else 0
-        print_nearest_debug_info(executable, trace_a, start_idx, prev_addr)
+        print_nearest_debug_info(executable, trace_a, start_idx)
     else:
         f, l, c = info
         print(f"0x{prev_addr:x}: {f}:{l}:{c}")
@@ -310,7 +310,14 @@ def write_int_file(path: str, value: int, size: int) -> None:
         f.write(int(value).to_bytes(size, byteorder="big", signed=False))
 
 
-def mode_input_values(executable: str, secret_spec: str, public_spec: str, timeout: int) -> int:
+def mode_input_values(
+    executable: str,
+    secret_spec: str,
+    public_spec: str,
+    timeout: int,
+    expected_filename: Optional[str] = None,
+    expected_line: Optional[int] = None,
+) -> int:
     """
     Mode --input:
       --secret v1:8=100/200,v2:4=300/400
@@ -367,11 +374,99 @@ def mode_input_values(executable: str, secret_spec: str, public_spec: str, timeo
         if info is None:
             print(f"Divergence after 0x{prev_addr:x}, ", end="")
             start_idx = (pos - 1) if (pos is not None and pos > 0) else 0
-            print_nearest_debug_info(executable, trace_a, start_idx, prev_addr)
-        else:
-            f, l, c = info
-            print(f"0x{prev_addr:x}: {f}:{l}:{c}")
+            print_nearest_debug_info(executable, trace_a, start_idx)
+
+            # In plain --input mode, any divergence is considered success.
+            # In checked mode (abacus-json), missing debug info means mismatch.
+            if expected_filename is not None and expected_line is not None:
+                return 3
+            return 0
+
+        f, l, c = info
+        print(f"0x{prev_addr:x}: {f}:{l}:{c}")
+
+        if expected_filename is not None and expected_line is not None:
+            same_file = os.path.basename(expected_filename) == os.path.basename(f)
+            same_line = (l == expected_line)
+            if not (same_file and same_line):
+                print(
+                    f"Location mismatch: expected {expected_filename}:{expected_line}, got {f}:{l}:{c}"
+                )
+                return 3
+
         return 0
+
+
+def mode_abacus_json(input_json: str, executable: str, sym_size: int, timeout: int, output: Optional[str]) -> int:
+    """Batch reproduction for Abacus-style JSON rows containing counterexamples dicts."""
+    import pandas as pd  # type: ignore
+    from common import load_combined_json, save_combined_json  # type: ignore
+
+    df = load_combined_json(input_json)
+    if "counterexamples" not in df.columns:
+        if len(df.index) == 0:
+            save_combined_json(df, output if output else input_json)
+            return 0
+        print("Error: counterexamples column missing in input JSON", file=sys.stderr)
+        return 2
+
+    if "reproduced" not in df.columns:
+        df["reproduced"] = pd.NA
+
+    for idx, row in df.iterrows():
+        cex = row.get("counterexamples")
+        if not isinstance(cex, dict):
+            df.at[idx, "reproduced"] = False
+            continue
+
+        exp = cex.get("exp")
+        exp_prime = cex.get("exp__prime")
+        if exp is None or exp_prime is None:
+            df.at[idx, "reproduced"] = False
+            continue
+
+        filename = row.get("filename")
+        line = row.get("line")
+        print(f"Reproducing {filename}:{line} ... ", end="", flush=True)
+
+        secret_spec = f"exp:{sym_size}={int(exp)}/{int(exp_prime)}"
+        public_spec = ""
+        if cex.get("base") is not None and cex.get("mod") is not None:
+            public_spec = f"base:{sym_size}={int(cex['base'])},mod:{sym_size}={int(cex['mod'])}"
+
+        expected_filename = filename if isinstance(filename, str) else None
+        expected_line = None
+        try:
+            if line is not None:
+                expected_line = int(line)
+        except Exception:
+            expected_line = None
+
+        rc = mode_input_values(
+            executable=executable,
+            secret_spec=secret_spec,
+            public_spec=public_spec,
+            timeout=timeout,
+            expected_filename=expected_filename,
+            expected_line=expected_line,
+        )
+        if rc == 0:
+            print("Success")
+            df.at[idx, "reproduced"] = True
+        else:
+            print("Failed")
+            df.at[idx, "reproduced"] = False
+
+    for col in ["visit_count", "non_ct_count", "visit_time"]:
+        if col in df.columns:
+            try:
+                if df[col].isna().all():
+                    df = df.drop(columns=[col])
+            except Exception:
+                pass
+
+    save_combined_json(df, output if output else input_json)
+    return 0
 
 
 def build_parsers_and_dispatch(argv: List[str]) -> int:
@@ -402,6 +497,11 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
             "--secret v1:8=100/200,v2:4=300/400 --public v3:8=500"
         ),
     )
+    group.add_argument(
+        "--abacus-json",
+        dest="abacus_json",
+        help="Path to Abacus-style JSON containing per-row counterexamples for batch input-value reproduction.",
+    )
     parser.add_argument(
         "--klee-output",
         dest="klee_output",
@@ -414,7 +514,7 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
     )
     parser.add_argument(
         "--secret",
-        required=True,
+        required=False,
         help=(
             "In --json/--file modes: comma-separated secret variable names.\n"
             "In --input mode: comma-separated name:bytes=orig/prime (e.g., v1:8=100/200)."
@@ -438,15 +538,24 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
     parser.add_argument(
         "--timeout",
         required=False,
-        default=300,
+        default=600,
         type=int,
-        help="Maximum time (in seconds) to allow for each replay (default: 300s).",
+        help="Maximum time (in seconds) to allow for each replay (default: 600s).",
+    )
+    parser.add_argument(
+        "--sym-size",
+        required=False,
+        default=4,
+        type=int,
+        help="Symbol byte size for --abacus-json mode (default: 4).",
     )
     args = parser.parse_args(argv)
 
     if args.json_path:
         if not args.klee_output:
             parser.error("--klee-output is required when using --json")
+        if not args.secret:
+            parser.error("--secret is required when using --json")
         mode_dataframe(
             input_json=args.json_path,
             klee_output=args.klee_output,
@@ -459,6 +568,8 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
         return 0
 
     if args.ktest_file:
+        if not args.secret:
+            parser.error("--secret is required when using --file")
         return mode_ktest_file(
             executable=args.executable,
             ktest_file=args.ktest_file,
@@ -467,7 +578,18 @@ def build_parsers_and_dispatch(argv: List[str]) -> int:
             timeout=args.timeout,
         )
 
+    if args.abacus_json:
+        return mode_abacus_json(
+            input_json=args.abacus_json,
+            executable=args.executable,
+            sym_size=args.sym_size,
+            timeout=args.timeout,
+            output=args.output,
+        )
+
     # --input mode
+    if not args.secret:
+        parser.error("--secret is required when using --input")
     return mode_input_values(
         executable=args.executable,
         secret_spec=args.secret,
