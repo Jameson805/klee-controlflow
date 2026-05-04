@@ -76,7 +76,6 @@ cl::opt<bool> OutputIStats("output-istats", cl::init(true),
                            cl::desc("Write instruction level statistics in "
                                     "callgrind format (default=true)"),
                            cl::cat(StatsCat));
-
 cl::opt<std::string> StatsWriteInterval(
     "stats-write-interval", cl::init("1s"),
     cl::desc("Approximate time between stats writes (default=1s)"),
@@ -119,18 +118,6 @@ cl::opt<bool> UseCallPaths("use-call-paths", cl::init(true),
                            cl::cat(StatsCat));
 
 } // namespace klee
-
-namespace {
-StatsTracker *activeStatsTracker = nullptr;
-bool nonCtExitHookRegistered = false;
-
-void flushNonCtOnExit() {
-  if (activeStatsTracker)
-    activeStatsTracker->printNonCt();
-}
-} // namespace
-
-///
 
 bool StatsTracker::useStatistics() {
   return OutputStats || OutputIStats;
@@ -306,17 +293,9 @@ StatsTracker::StatsTracker(Executor &_executor, std::string _objectFilename,
     }
   }
 
-  activeStatsTracker = this;
-  if (!nonCtExitHookRegistered) {
-    std::atexit(flushNonCtOnExit);
-    nonCtExitHookRegistered = true;
-  }
 }
 
 StatsTracker::~StatsTracker() {  
-  if (activeStatsTracker == this)
-    activeStatsTracker = nullptr;
-
   if (statsFile) {
     auto rc = sqlite3_step(transactionEndStmt);
     if (rc != SQLITE_DONE) {
@@ -333,6 +312,8 @@ StatsTracker::~StatsTracker() {
 void StatsTracker::done() {
   if (statsFile)
     writeStatsLine();
+
+  printNonCt();
 
   if (OutputIStats) {
     if (updateMinDistToUncovered)
@@ -1106,6 +1087,10 @@ bool StatsTracker::visitNonCt(NonCtType type, bool isNonCt, KInstruction *ki, do
 
 // TODO: Write to a separate file
 void StatsTracker::printNonCt() {
+  if (nonCtPrinted)
+    return;
+
+  nonCtPrinted = true;
   klee_message("Printing non-CT statistics");
   for (int i{0}; i < 2; ++i)
   {

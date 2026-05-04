@@ -70,6 +70,7 @@ namespace klee {
       std::optional<double> nonCtTime;
     };
     std::array<std::map<KInstruction *, NonCtInfo>, 2> nonCtInfo;
+    bool nonCtPrinted = false;
 
   public:
     static bool useStatistics();
