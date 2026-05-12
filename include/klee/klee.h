@@ -36,6 +36,19 @@ extern "C" {
    */
   void klee_make_symbolic(void *addr, size_t nbytes, const char *name);
 
+  /* klee_make_symbolic_sc - Make the contents of the object pointed to by
+   * addr symbolic and mark whether the object is secret.
+   *
+   * \arg addr - The start of the object.
+   * \arg nbytes - The number of bytes to make symbolic; currently this *must*
+   * be the entire contents of the object.
+   * \arg name - A name used for identifying the object in messages, output
+   * files, etc. If NULL, object is called "unnamed".
+   * \arg is_secret - Boolean, whether the object is considered secret.
+   */
+  void klee_make_symbolic_sc(void *addr, size_t nbytes, const char *name,
+                             int is_secret);
+
   /* klee_range - Construct a symbolic value in the signed interval
    * [begin,end).
    *

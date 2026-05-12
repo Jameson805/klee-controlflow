@@ -57,7 +57,8 @@ public:
                            const ref<ConstantExpr> *constantValuesBegin = 0,
                            const ref<ConstantExpr> *constantValuesEnd = 0,
                            Expr::Width _domain = Expr::Int32,
-                           Expr::Width _range = Expr::Int8);
+                           Expr::Width _range = Expr::Int8,
+                           bool isSecret = false);
 
 private:
   typedef std::unordered_set<const Array *, klee::ArrayHashFn,

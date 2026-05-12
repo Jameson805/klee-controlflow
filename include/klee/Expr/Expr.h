@@ -508,6 +508,9 @@ public:
   /// the array size.
   const std::vector<ref<ConstantExpr> > constantValues;
 
+  /// Whether this symbolic array represents secret data.
+  const bool isSecret;
+
 private:
   unsigned hashValue;
 
@@ -529,7 +532,8 @@ private:
   Array(const std::string &_name, uint64_t _size,
         const ref<ConstantExpr> *constantValuesBegin = 0,
         const ref<ConstantExpr> *constantValuesEnd = 0,
-        Expr::Width _domain = Expr::Int32, Expr::Width _range = Expr::Int8);
+      Expr::Width _domain = Expr::Int32, Expr::Width _range = Expr::Int8,
+      bool isSecret = false);
 
 public:
   bool isSymbolicArray() const { return constantValues.empty(); }

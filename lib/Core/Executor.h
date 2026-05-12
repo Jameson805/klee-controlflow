@@ -189,6 +189,9 @@ private:
   /// Assumes ownership of the created array objects
   ArrayCache arrayCache;
 
+  /// Map from secret symbolic names to their primed copies.
+  std::map<std::string, const Array *> prime;
+
   /// File to print executed instructions to
   std::unique_ptr<llvm::raw_ostream> debugInstFile;
 
@@ -320,7 +323,7 @@ private:
                               KInstruction *target /* undef if write */);
 
   void executeMakeSymbolic(ExecutionState &state, const MemoryObject *mo,
-                           const std::string &name);
+                           const std::string &name, bool isSecret);
 
   /// Create a new state where each input condition has been added as
   /// a constraint and return the results. The input state is included
@@ -508,6 +511,8 @@ private:
   /// Only for debug purposes; enable via debugger or klee-control
   void dumpStates();
   void dumpExecutionTree();
+
+  std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
 
 public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,

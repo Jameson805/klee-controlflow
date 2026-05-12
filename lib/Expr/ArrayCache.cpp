@@ -20,10 +20,11 @@ const Array *
 ArrayCache::CreateArray(const std::string &_name, uint64_t _size,
                         const ref<ConstantExpr> *constantValuesBegin,
                         const ref<ConstantExpr> *constantValuesEnd,
-                        Expr::Width _domain, Expr::Width _range) {
+                        Expr::Width _domain, Expr::Width _range,
+                        bool isSecret) {
 
   const Array *array = new Array(_name, _size, constantValuesBegin,
-                                 constantValuesEnd, _domain, _range);
+                                 constantValuesEnd, _domain, _range, isSecret);
   if (array->isSymbolicArray()) {
     std::pair<ArrayHashMap::const_iterator, bool> success =
         cachedSymbolicArrays.insert(array);

@@ -92,6 +92,7 @@
 #include <iosfwd>
 #include <limits>
 #include <sstream>
+#include <functional>
 #include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -4599,7 +4600,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
 void Executor::executeMakeSymbolic(ExecutionState &state, 
                                    const MemoryObject *mo,
-                                   const std::string &name) {
+                                   const std::string &name,
+                                   bool isSecret) {
   // Create a new object state for the memory object (instead of a copy).
   if (!replayKTest) {
     // Find a unique name for this array.  First try the original name,
@@ -4609,9 +4611,19 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     while (!state.arrayNames.insert(uniqueName).second) {
       uniqueName = name + "_" + llvm::utostr(++id);
     }
-    const Array *array = arrayCache.CreateArray(uniqueName, mo->size);
+    const Array *array =
+        arrayCache.CreateArray(uniqueName, mo->size, 0, 0, Expr::Int32,
+                               Expr::Int8, isSecret);
     bindObjectInState(state, mo, false, array);
     state.addSymbolic(mo, array);
+
+    if (array->isSecret) {
+      prime[array->name] = arrayCache.CreateArray(
+          array->name + "__prime", array->size,
+          array->constantValues.data(),
+          array->constantValues.data() + array->constantValues.size(),
+          array->domain, array->range, array->isSecret);
+    }
     
     auto found = seedMap.find(&state);
     if (found != seedMap.end()) {
@@ -4665,6 +4677,94 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       }
     }
   }
+}
+
+std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e) {
+  std::map<ref<Expr>, std::pair<bool, ref<Expr>>> visited;
+  std::map<const UpdateNode *, std::pair<bool, ref<UpdateNode>>> visitedUpdates;
+
+  std::function<std::pair<bool, ref<UpdateNode>>(const ref<UpdateNode> &)> helperUpdates;
+  std::function<std::pair<bool, ref<Expr>>(const ref<Expr> &)> helper;
+
+  helperUpdates = [&](const ref<UpdateNode> &node)
+      -> std::pair<bool, ref<UpdateNode>> {
+    if (!node)
+      return {false, nullptr};
+
+    auto it = visitedUpdates.find(node.get());
+    if (it != visitedUpdates.end())
+      return it->second;
+
+    auto [nextChanged, newNext] = helperUpdates(node->next);
+    auto [idxChanged, newIdx] = helper(node->index);
+    auto [valChanged, newVal] = helper(node->value);
+
+    std::pair<bool, ref<UpdateNode>> result;
+    if (nextChanged || idxChanged || valChanged) {
+      result = {true, ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})};
+    } else {
+      result = {false, node};
+    }
+
+    visitedUpdates.insert({node.get(), result});
+    return result;
+  };
+
+  helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
+    if (dyn_cast<ConstantExpr>(expr))
+      return {false, expr};
+
+    auto it = visited.find(expr);
+    if (it != visited.end())
+      return it->second;
+
+    std::pair<bool, ref<Expr>> result;
+
+    if (auto re = dyn_cast<ReadExpr>(expr)) {
+      const Array *root = re->updates.root;
+      const Array *newRoot = root;
+      bool rootChanged = false;
+
+      if (root->isSecret) {
+        auto itPrime = prime.find(root->name);
+        assert(itPrime != prime.end() &&
+               "secret symbolic not found in prime map");
+        newRoot = itPrime->second;
+        rootChanged = true;
+      }
+
+      auto [indexChanged, newIndex] = helper(re->index);
+      auto [updatesChanged, newHead] = helperUpdates(re->updates.head);
+
+      if (rootChanged || indexChanged || updatesChanged) {
+        UpdateList newUpdates{newRoot, newHead};
+        result = {true, ReadExpr::create(newUpdates, newIndex)};
+      } else {
+        result = {false, expr};
+      }
+    } else {
+      bool hasSecret = false;
+      std::vector<ref<Expr>> kids;
+      kids.reserve(expr->getNumKids());
+
+      for (unsigned i = 0; i < expr->getNumKids(); ++i) {
+        auto [kidHasSecret, rebuiltKid] = helper(expr->getKid(i));
+        hasSecret = hasSecret || kidHasSecret;
+        kids.push_back(rebuiltKid);
+      }
+
+      if (hasSecret) {
+        result = {true, expr->rebuild(kids.data())};
+      } else {
+        result = {false, expr};
+      }
+    }
+
+    visited.insert({expr, result});
+    return result;
+  };
+
+  return helper(e);
 }
 
 /***/
