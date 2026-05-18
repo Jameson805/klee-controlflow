@@ -40,6 +40,26 @@ struct InstructionInfo;
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const MemoryMap &mm);
 
+/// Distinguishes the observable events that participate in self-composition.
+/// Branch events record the taken edge, while memory events record the
+/// resolved address seen by the completed trace.
+enum class SelfCompEventKind {
+  Branch,
+  MemoryLoad,
+  MemoryStore,
+};
+
+/// One observable step in the trace used for relational comparison.
+/// `prefixCondition` captures the path constraints immediately before the
+/// event, and `observedValue` stores the branch decision or memory address
+/// whose equality/divergence is checked later in Executor.
+struct SelfCompEvent {
+  SelfCompEventKind kind;
+  std::uint64_t siteId;
+  ref<Expr> prefixCondition;
+  ref<Expr> observedValue;
+};
+
 struct StackFrame {
   KInstIterator caller;
   KFunction *kf;
@@ -254,6 +274,11 @@ public:
   /// @brief Mapping MemoryObject addresses to refs used in the base_addrs map
   using base_mo_t = std::map<uint64_t, std::set<ref<Expr>>>;
   base_mo_t base_mos;
+
+  /// @brief Observable trace collected for self-composition comparison.
+  /// This is copied when states fork so each completed state retains the
+  /// exact branch and memory observations that led to its final path.
+  std::vector<SelfCompEvent> selfCompTrace;
 
 public:
 #ifdef KLEE_UNITTEST

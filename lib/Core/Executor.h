@@ -63,6 +63,7 @@ struct Cell;
 class ExecutionState;
 class ExternalDispatcher;
 class Expr;
+struct InstructionInfo;
 class InstructionInfoTable;
 class KCallable;
 struct KFunction;
@@ -83,6 +84,36 @@ class TreeStreamWriter;
 class MergeHandler;
 class MergingSearcher;
 template <class T> class ref;
+
+/// Classification for the outcome of a relational trace comparison.
+/// Reportable branch/memory results correspond to localized findings, while the
+/// unlocalizable cases mean the two traces stopped aligning before a concrete
+/// source site could be blamed.
+enum class SelfCompDivergenceKind {
+  None,
+  UnlocalizableLengthMismatch,
+  UnlocalizablePrefixInfeasible,
+  UnlocalizableKindMismatch,
+  UnlocalizableSiteMismatch,
+  BranchSideChannel,
+  MemorySideChannel,
+};
+
+/// A finished observable trace plus the full path condition needed to ensure a
+/// reported divergence is compatible with the exact completed executions being
+/// compared.
+struct CompletedTrace {
+  std::vector<SelfCompEvent> events;
+  ref<Expr> finalPathCondition;
+};
+
+/// Result of checking one aligned trace index under self-composition.
+struct SelfCompDivergence {
+  SelfCompDivergenceKind kind{SelfCompDivergenceKind::None};
+  unsigned index{0};
+  std::uint64_t leftSiteId{0};
+  std::uint64_t rightSiteId{0};
+};
 
 /// \todo Add a context object to keep track of data only live
 /// during an instruction step. Should contain addedStates,
@@ -191,6 +222,18 @@ private:
 
   /// Map from secret symbolic names to their primed copies.
   std::map<std::string, const Array *> prime;
+
+  /// Completed traces used for self-composition comparison.
+  /// Each terminated state is compared against its primed copy and all earlier
+  /// completed traces so later states can report same-path and cross-path
+  /// relational divergences.
+  std::vector<CompletedTrace> completedTraces;
+
+  /// First reported self-composition findings, keyed by kind and site id.
+  /// This keeps stdout/messages.txt aligned with the controlflow-style
+  /// reporting contract by emitting at most one counterexample per kind/site.
+  std::set<std::pair<SelfCompDivergenceKind, std::uint64_t>>
+      loggedSelfCompDivergences;
 
   /// File to print executed instructions to
   std::unique_ptr<llvm::raw_ostream> debugInstFile;
@@ -513,6 +556,31 @@ private:
   void dumpExecutionTree();
 
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
+  std::pair<bool, CompletedTrace> renameSecret(const CompletedTrace &trace);
+  ref<Expr> materializeConstraints(const ConstraintSet &constraints) const;
+  ref<Expr> buildSecretInequality(const ExecutionState &state) const;
+  void recordBranchEvent(ExecutionState &state, KInstruction *ki,
+                         ref<Expr> prefixCondition, bool taken);
+  void recordMemoryEvent(ExecutionState &state, KInstruction *target,
+                         ref<Expr> prefixCondition, bool isWrite,
+                         ref<Expr> address);
+  /// Compare two completed traces under secret renaming.
+  /// For each aligned site, this asks whether all earlier observations can be
+  /// kept equal while the current observation diverges, and it only reports a
+  /// site when that witness is compatible with both completed trace suffixes.
+  std::vector<SelfCompDivergence> findDivergences(const CompletedTrace &left,
+                                                  const CompletedTrace &right,
+                                                  ExecutionState &state);
+  std::string formatSelfCompDivergence(const SelfCompDivergence &divergence) const;
+  const InstructionInfo *findSelfCompInstructionInfo(std::uint64_t siteId) const;
+  bool writeSelfCompCounterexampleKTest(
+      const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,
+      const std::string &testName);
+  void logSelfCompDivergence(ExecutionState &state,
+                             const SelfCompDivergence &divergence);
+  /// Compare one newly completed state against the accumulated trace corpus and
+  /// return the per-test summary stored in the emitted testcase file.
+  std::string compareAgainstCompletedTraces(ExecutionState &state);
 
 public:
   Executor(llvm::LLVMContext &ctx, const InterpreterOptions &opts,

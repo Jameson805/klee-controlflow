@@ -981,6 +981,65 @@ void Executor::branch(ExecutionState &state,
       addConstraint(*result[i], conditions[i]);
 }
 
+ref<Expr>
+Executor::materializeConstraints(const ConstraintSet &constraints) const {
+  ref<Expr> result = ConstantExpr::alloc(1, Expr::Bool);
+  for (const auto &constraint : constraints) {
+    result = AndExpr::create(result, constraint);
+  }
+  return result;
+}
+
+// Self-composition compares one completed trace against either its primed copy
+// or an earlier completed trace. Each event stores the path constraints that
+// held immediately before it, and the comparison below asks a target-centered
+// question at every aligned index: can all earlier observations stay equal,
+// can this exact completed-trace pair still be realized, and can the current
+// observation differ? Only those witnesses are reported as localized findings.
+ref<Expr> Executor::buildSecretInequality(const ExecutionState &state) const {
+  ref<Expr> secretInequality = ConstantExpr::alloc(0, Expr::Bool);
+
+  for (const auto &symbolic : state.symbolics) {
+    const Array *array = symbolic.second;
+    if (!array->isSecret) {
+      continue;
+    }
+
+    auto itPrime = prime.find(array->name);
+    if (itPrime == prime.end()) {
+      continue;
+    }
+
+    UpdateList originalUpdates(array, nullptr);
+    UpdateList primedUpdates(itPrime->second, nullptr);
+    for (std::uint64_t index = 0; index < array->size; ++index) {
+      ref<Expr> idx = ConstantExpr::create(index, array->domain);
+      ref<Expr> differs = NeExpr::create(ReadExpr::create(originalUpdates, idx),
+                                         ReadExpr::create(primedUpdates, idx));
+      secretInequality = OrExpr::create(secretInequality, differs);
+    }
+  }
+
+  return secretInequality;
+}
+
+void Executor::recordBranchEvent(ExecutionState &state, KInstruction *ki,
+                                 ref<Expr> prefixCondition, bool taken) {
+  state.selfCompTrace.push_back(SelfCompEvent{
+      SelfCompEventKind::Branch, ki->info->id, prefixCondition,
+      ConstantExpr::alloc(taken, Expr::Bool)});
+}
+
+void Executor::recordMemoryEvent(ExecutionState &state, KInstruction *target,
+                 ref<Expr> prefixCondition, bool isWrite,
+                 ref<Expr> address) {
+  const KInstruction *site = target ? target : state.prevPC;
+  assert(site && "memory event requires instruction site");
+  state.selfCompTrace.push_back(SelfCompEvent{
+    isWrite ? SelfCompEventKind::MemoryStore : SelfCompEventKind::MemoryLoad,
+    site->info->id, prefixCondition, address});
+}
+
 ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
                                        ref<Expr> condition) {
   if (isa<klee::ConstantExpr>(condition))
@@ -2224,7 +2283,9 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // FIXME: Find a way that we don't have this hidden dependency.
       assert(bi->getCondition() == bi->getOperand(0) &&
              "Wrong operand index!");
-      ref<Expr> cond = eval(ki, 0, state).value;
+        ref<Expr> cond = eval(ki, 0, state).value;
+        ref<Expr> branchPrefixCondition =
+          materializeConstraints(state.constraints);
 
       cond = optimizer.optimizeExpr(cond, false);
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
@@ -2235,6 +2296,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // up with convenient instruction specific data.
       if (statsTracker && state.stack.back().kf->trackCoverage)
         statsTracker->markBranchVisited(branches.first, branches.second);
+
+      if (branches.first)
+        recordBranchEvent(*branches.first, ki, branchPrefixCondition, true);
+      if (branches.second)
+        recordBranchEvent(*branches.second, ki, branchPrefixCondition, false);
 
       if (branches.first)
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
@@ -3804,9 +3870,11 @@ static std::string terminationTypeFileExtension(StateTerminationType type) {
 
 void Executor::terminateStateOnExit(ExecutionState &state) {
   ++stats::terminationExit;
+  std::string selfCompMessage = compareAgainstCompletedTraces(state);
   if (shouldWriteTest(state) || (AlwaysOutputSeeds && seedMap.count(&state)))
     interpreterHandler->processTestCase(
-        state, nullptr,
+        state, selfCompMessage.empty() ? nullptr
+                                       : (selfCompMessage + "\n").c_str(),
         terminationTypeFileExtension(StateTerminationType::Exit).c_str());
 
   interpreterHandler->incPathsCompleted();
@@ -4491,6 +4559,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
       if (inBounds) {
         const ObjectState *os = op.second;
+        ref<Expr> prefixCondition = materializeConstraints(state.constraints);
         if (isWrite) {
           if (os->readOnly) {
             terminateStateOnProgramError(state, "memory error: object read only",
@@ -4498,6 +4567,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
           } else {
             ObjectState *wos = state.addressSpace.getWriteable(mo, os);
             wos->write(offset, value);
+            recordMemoryEvent(state, target, prefixCondition, true, address);
           }
         } else {
           ref<Expr> result = os->read(offset, type);
@@ -4506,6 +4576,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
             result = replaceReadWithSymbolic(state, result);
 
           bindLocal(target, state, result);
+          recordMemoryEvent(state, target, prefixCondition, false, address);
         }
 
         return;
@@ -4541,6 +4612,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
     // bound can be 0 on failure or overlapped 
     if (bound) {
+      ref<Expr> prefixCondition = materializeConstraints(bound->constraints);
       if (isWrite) {
         if (os->readOnly) {
           terminateStateOnProgramError(*bound, "memory error: object read only",
@@ -4548,10 +4620,12 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         } else {
           ObjectState *wos = bound->addressSpace.getWriteable(mo, os);
           wos->write(mo->getOffsetExpr(address), value);
+          recordMemoryEvent(*bound, target, prefixCondition, true, address);
         }
       } else {
         ref<Expr> result = os->read(mo->getOffsetExpr(address), type);
         bindLocal(target, *bound, result);
+        recordMemoryEvent(*bound, target, prefixCondition, false, address);
       }
     }
 
@@ -4765,6 +4839,357 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e) {
   };
 
   return helper(e);
+}
+
+std::pair<bool, CompletedTrace>
+Executor::renameSecret(const CompletedTrace &trace) {
+  bool changed = false;
+  CompletedTrace renamed;
+  renamed.events.reserve(trace.events.size());
+
+  for (const auto &event : trace.events) {
+    auto [prefixChanged, renamedPrefix] = renameSecret(event.prefixCondition);
+    auto [valueChanged, renamedValue] = renameSecret(event.observedValue);
+    changed = changed || prefixChanged || valueChanged;
+    renamed.events.push_back(SelfCompEvent{event.kind, event.siteId,
+                                           renamedPrefix, renamedValue});
+  }
+
+  auto [pathChanged, renamedPath] = renameSecret(trace.finalPathCondition);
+  changed = changed || pathChanged;
+  renamed.finalPathCondition = renamedPath;
+  return {changed, renamed};
+}
+
+std::vector<SelfCompDivergence>
+Executor::findDivergences(const CompletedTrace &left,
+                          const CompletedTrace &right,
+                          ExecutionState &state) {
+  std::vector<SelfCompDivergence> divergences;
+  ref<Expr> secretInequality = buildSecretInequality(state);
+  if (secretInequality->isFalse()) {
+    return divergences;
+  }
+  ref<Expr> completedPair =
+      AndExpr::create(left.finalPathCondition, right.finalPathCondition);
+
+  ConstraintSet noConstraints;
+  auto isFeasible = [&](const ref<Expr> &query) {
+    bool result = false;
+    bool success = solver->mayBeTrue(noConstraints, query, result,
+                                     state.queryMetaData);
+    assert(success && "FIXME: Unhandled solver failure");
+    return result;
+  };
+
+  ref<Expr> matchedPrefix = secretInequality;
+  unsigned index = 0;
+  for (; index < left.events.size() && index < right.events.size(); ++index) {
+    const auto &leftEvent = left.events[index];
+    const auto &rightEvent = right.events[index];
+
+    ref<Expr> relationalPrefix = AndExpr::create(
+        matchedPrefix,
+        AndExpr::create(leftEvent.prefixCondition, rightEvent.prefixCondition));
+    ref<Expr> completedPrefix =
+        AndExpr::create(relationalPrefix, completedPair);
+    if (!isFeasible(completedPrefix)) {
+      SelfCompDivergence divergence;
+      divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
+      divergence.index = index;
+      divergence.leftSiteId = leftEvent.siteId;
+      divergence.rightSiteId = rightEvent.siteId;
+      divergences.push_back(divergence);
+      return divergences;
+    }
+
+    if (leftEvent.kind != rightEvent.kind) {
+      SelfCompDivergence divergence;
+      divergence.kind = SelfCompDivergenceKind::UnlocalizableKindMismatch;
+      divergence.index = index;
+      divergence.leftSiteId = leftEvent.siteId;
+      divergence.rightSiteId = rightEvent.siteId;
+      divergences.push_back(divergence);
+      return divergences;
+    }
+
+    if (leftEvent.siteId != rightEvent.siteId) {
+      SelfCompDivergence divergence;
+      divergence.kind = SelfCompDivergenceKind::UnlocalizableSiteMismatch;
+      divergence.index = index;
+      divergence.leftSiteId = leftEvent.siteId;
+      divergence.rightSiteId = rightEvent.siteId;
+      divergences.push_back(divergence);
+      return divergences;
+    }
+
+    ref<Expr> equals =
+        EqExpr::create(leftEvent.observedValue, rightEvent.observedValue);
+    ref<Expr> differs =
+        NeExpr::create(leftEvent.observedValue, rightEvent.observedValue);
+    if (isFeasible(AndExpr::create(completedPrefix, differs))) {
+      SelfCompDivergence divergence;
+      divergence.index = index;
+      divergence.leftSiteId = leftEvent.siteId;
+      divergence.rightSiteId = rightEvent.siteId;
+      switch (leftEvent.kind) {
+      case SelfCompEventKind::Branch:
+        divergence.kind = SelfCompDivergenceKind::BranchSideChannel;
+        break;
+      case SelfCompEventKind::MemoryLoad:
+      case SelfCompEventKind::MemoryStore:
+        divergence.kind = SelfCompDivergenceKind::MemorySideChannel;
+        break;
+      }
+      divergences.push_back(divergence);
+    }
+
+    ref<Expr> equalPrefix = AndExpr::create(relationalPrefix, equals);
+    if (!isFeasible(AndExpr::create(equalPrefix, completedPair))) {
+      return divergences;
+    }
+
+    matchedPrefix = equalPrefix;
+  }
+
+  if (left.events.size() == right.events.size()) {
+    return divergences;
+  }
+
+  ref<Expr> leftPrefix =
+      index < left.events.size() ? left.events[index].prefixCondition
+                                 : left.finalPathCondition;
+  ref<Expr> rightPrefix =
+      index < right.events.size() ? right.events[index].prefixCondition
+                                  : right.finalPathCondition;
+  SelfCompDivergence divergence;
+  if (!isFeasible(AndExpr::create(
+          AndExpr::create(matchedPrefix,
+                          AndExpr::create(leftPrefix, rightPrefix)),
+          completedPair))) {
+    divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
+  } else {
+    divergence.kind = SelfCompDivergenceKind::UnlocalizableLengthMismatch;
+  }
+  divergence.index = index;
+  divergence.leftSiteId = index < left.events.size() ? left.events[index].siteId : 0;
+  divergence.rightSiteId =
+      index < right.events.size() ? right.events[index].siteId : 0;
+  divergences.push_back(divergence);
+  return divergences;
+}
+
+std::string
+Executor::formatSelfCompDivergence(const SelfCompDivergence &divergence) const {
+  std::ostringstream os;
+  os << "self-comp divergence at trace index " << divergence.index;
+
+  switch (divergence.kind) {
+  case SelfCompDivergenceKind::None:
+    return "";
+  case SelfCompDivergenceKind::UnlocalizableLengthMismatch:
+    os << ": traces differ in length before localization";
+    break;
+  case SelfCompDivergenceKind::UnlocalizablePrefixInfeasible:
+    os << ": traces already diverged before this step (prefix infeasible)";
+    break;
+  case SelfCompDivergenceKind::UnlocalizableKindMismatch:
+    os << ": event kinds differ before localization";
+    break;
+  case SelfCompDivergenceKind::UnlocalizableSiteMismatch:
+    os << ": event sites differ before localization";
+    break;
+  case SelfCompDivergenceKind::BranchSideChannel:
+    os << ": localized branch side-channel at site " << divergence.leftSiteId;
+    break;
+  case SelfCompDivergenceKind::MemorySideChannel:
+    os << ": localized memory side-channel at site " << divergence.leftSiteId;
+    break;
+  }
+
+  if (divergence.kind == SelfCompDivergenceKind::UnlocalizableKindMismatch) {
+    os << " (left kind and right kind differ)";
+  }
+
+  if (divergence.kind == SelfCompDivergenceKind::UnlocalizableSiteMismatch ||
+      (divergence.leftSiteId != divergence.rightSiteId &&
+       divergence.rightSiteId != 0)) {
+    os << " (left site " << divergence.leftSiteId << ", right site "
+       << divergence.rightSiteId << ")";
+  }
+  return os.str();
+}
+
+const InstructionInfo *
+Executor::findSelfCompInstructionInfo(std::uint64_t siteId) const {
+  for (const auto &function : kmodule->functions) {
+    KFunction *kf = function.get();
+    for (unsigned index = 0; index < kf->numInstructions; ++index) {
+      KInstruction *instruction = kf->instructions[index];
+      if (instruction->info && instruction->info->id == siteId) {
+        return instruction->info;
+      }
+    }
+  }
+
+  return nullptr;
+}
+
+bool Executor::writeSelfCompCounterexampleKTest(
+    const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,
+    const std::string &testName) {
+  std::string path = interpreterHandler->getOutputFilename(testName);
+  klee_message("Writing KTest file: %s", path.c_str());
+
+  KTest b;
+  b.numArgs = 0;
+  b.args = nullptr;
+  b.symArgvs = 0;
+  b.symArgvLen = 0;
+  b.numObjects = out.size();
+  b.objects = new KTestObject[b.numObjects];
+  assert(b.objects);
+  for (unsigned i = 0; i < b.numObjects; i++) {
+    KTestObject *o = &b.objects[i];
+    o->name = const_cast<char *>(out[i].first.c_str());
+    o->numBytes = out[i].second.size();
+    o->bytes = new unsigned char[o->numBytes];
+    assert(o->bytes);
+    std::copy(out[i].second.begin(), out[i].second.end(), o->bytes);
+  }
+
+  bool status = true;
+  if (!kTest_toFile(&b, path.c_str())) {
+    status = false;
+    klee_warning("unable to write output test case, losing it");
+  }
+
+  for (unsigned i = 0; i < b.numObjects; i++)
+    delete[] b.objects[i].bytes;
+  delete[] b.objects;
+  return status;
+}
+
+void Executor::logSelfCompDivergence(ExecutionState &state,
+                                     const SelfCompDivergence &divergence) {
+  if (divergence.kind != SelfCompDivergenceKind::BranchSideChannel &&
+      divergence.kind != SelfCompDivergenceKind::MemorySideChannel) {
+    return;
+  }
+
+  auto key = std::make_pair(divergence.kind, divergence.leftSiteId);
+  if (!loggedSelfCompDivergences.insert(key).second) {
+    return;
+  }
+
+  const InstructionInfo *info =
+      findSelfCompInstructionInfo(divergence.leftSiteId);
+  std::string filename;
+  unsigned line = 0;
+  unsigned column = 0;
+  if (info) {
+    filename = info->file;
+    line = info->line;
+    column = info->column;
+  }
+
+  const bool isBranch =
+      divergence.kind == SelfCompDivergenceKind::BranchSideChannel;
+  std::string consolePrefix =
+      isBranch ? "[NON-CT BRANCH]" : "[NON-CT MEMORY]";
+  std::string filePrefix = isBranch ? "[BRANCH]" : "[MEMORY]";
+  std::string ktestPrefix =
+      isBranch ? "branch_counterexample_" : "memory_counterexample_";
+  double time = statsTracker ? statsTracker->elapsed().toSeconds() : 0.0;
+
+  klee_message((consolePrefix + " %lf : %u : %s : %u : %u").c_str(), time,
+               static_cast<unsigned>(divergence.leftSiteId), filename.c_str(),
+               line, column);
+
+  auto escapeJson = [](const std::string &value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+      switch (ch) {
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        escaped += ch;
+        break;
+      }
+    }
+    return escaped;
+  };
+
+  std::ostringstream record;
+  record << "{"
+      << "\"time\":" << std::fixed << std::setprecision(6) << time << ","
+         << "\"inst_id\":" << divergence.leftSiteId << ","
+         << "\"filename\":\"" << escapeJson(filename) << "\","
+         << "\"line\":" << line << ","
+         << "\"col\":" << column << ","
+      << "\"non_ct\":true"
+         << "}";
+
+  klee_message_to_file((filePrefix + " %s").c_str(), record.str().c_str());
+
+  std::vector<std::pair<std::string, std::vector<unsigned char>>> assignments;
+  if (getSymbolicSolution(state, assignments)) {
+    writeSelfCompCounterexampleKTest(
+        assignments,
+        ktestPrefix + std::to_string(divergence.leftSiteId) + ".ktest");
+  }
+}
+
+std::string Executor::compareAgainstCompletedTraces(ExecutionState &state) {
+  CompletedTrace current{state.selfCompTrace,
+                         materializeConstraints(state.constraints)};
+  std::string message;
+  std::set<std::string> reportedMessages;
+
+  // Compare against the primed version first so same-path leaks are reported
+  // before cross-path findings from earlier completed traces.
+  auto appendDivergence = [&](const CompletedTrace &candidate) {
+    for (const auto &divergence : findDivergences(current, candidate, state)) {
+      if (divergence.kind == SelfCompDivergenceKind::None) {
+        continue;
+      }
+
+      std::string formatted = formatSelfCompDivergence(divergence);
+      if (formatted.empty() || !reportedMessages.insert(formatted).second) {
+        continue;
+      }
+
+      logSelfCompDivergence(state, divergence);
+
+      if (!message.empty()) {
+        message += "\n";
+      }
+      message += formatted;
+    }
+  };
+
+  appendDivergence(renameSecret(current).second);
+
+  for (const auto &previous : completedTraces) {
+    appendDivergence(renameSecret(previous).second);
+  }
+
+  completedTraces.push_back(std::move(current));
+  return message;
 }
 
 /***/
