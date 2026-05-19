@@ -5070,6 +5070,67 @@ bool Executor::writeSelfCompCounterexampleKTest(
   return status;
 }
 
+bool Executor::getSelfCompCounterexampleSolution(
+    const ExecutionState &state,
+    std::vector<std::pair<std::string, std::vector<unsigned char>>> &res) {
+  // Self-composition counterexample KTests need both the original symbolic
+  // objects and their primed secret twins. The generic getSymbolicSolution()
+  // path only serializes state.symbolics, which is correct for normal test
+  // cases but drops exp__prime-style assignments from divergence artifacts.
+  solver->setTimeout(coreSolverTimeout);
+
+  ConstraintSet extendedConstraints(state.constraints);
+  ConstraintManager cm(extendedConstraints);
+
+  for (auto &pi : state.cexPreferences) {
+    bool mustBeTrue;
+    bool success = solver->mustBeTrue(
+        extendedConstraints, Expr::createIsZero(pi), mustBeTrue,
+        state.queryMetaData);
+    if (!success)
+      break;
+    if (!mustBeTrue)
+      cm.addConstraint(pi);
+  }
+
+  std::vector<const Array *> objects;
+  std::vector<std::pair<std::string, const Array *>> namedObjects;
+  namedObjects.reserve(state.symbolics.size() * 2);
+  for (const auto &symbolic : state.symbolics) {
+    const Array *array = symbolic.second;
+    namedObjects.emplace_back(symbolic.first->name, array);
+    objects.push_back(array);
+
+    if (!array->isSecret) {
+      continue;
+    }
+
+    auto itPrime = prime.find(array->name);
+    if (itPrime == prime.end()) {
+      continue;
+    }
+
+    namedObjects.emplace_back(itPrime->second->name, itPrime->second);
+    objects.push_back(itPrime->second);
+  }
+
+  std::vector<std::vector<unsigned char>> values;
+  bool success = solver->getInitialValues(extendedConstraints, objects, values,
+                                          state.queryMetaData);
+  solver->setTimeout(time::Span());
+  if (!success) {
+    klee_warning("unable to compute initial values (invalid constraints?)!");
+    ExprPPrinter::printQuery(llvm::errs(), state.constraints,
+                             ConstantExpr::alloc(0, Expr::Bool));
+    return false;
+  }
+
+  for (unsigned i = 0; i != namedObjects.size(); ++i) {
+    res.push_back(std::make_pair(namedObjects[i].first, values[i]));
+  }
+  return true;
+}
+
 void Executor::logSelfCompDivergence(ExecutionState &state,
                                      const SelfCompDivergence &divergence) {
   if (divergence.kind != SelfCompDivergenceKind::BranchSideChannel &&
@@ -5147,7 +5208,7 @@ void Executor::logSelfCompDivergence(ExecutionState &state,
   klee_message_to_file((filePrefix + " %s").c_str(), record.str().c_str());
 
   std::vector<std::pair<std::string, std::vector<unsigned char>>> assignments;
-  if (getSymbolicSolution(state, assignments)) {
+  if (getSelfCompCounterexampleSolution(state, assignments)) {
     writeSelfCompCounterexampleKTest(
         assignments,
         ktestPrefix + std::to_string(divergence.leftSiteId) + ".ktest");

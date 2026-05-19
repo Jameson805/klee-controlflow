@@ -573,6 +573,9 @@ private:
                                                   ExecutionState &state);
   std::string formatSelfCompDivergence(const SelfCompDivergence &divergence) const;
   const InstructionInfo *findSelfCompInstructionInfo(std::uint64_t siteId) const;
+    bool getSelfCompCounterexampleSolution(
+      const ExecutionState &state,
+      std::vector<std::pair<std::string, std::vector<unsigned char>>> &res);
   bool writeSelfCompCounterexampleKTest(
       const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,
       const std::string &testName);
