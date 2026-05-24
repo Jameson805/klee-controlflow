@@ -4927,11 +4927,16 @@ Executor::findDivergences(const CompletedTrace &left,
         EqExpr::create(leftEvent.observedValue, rightEvent.observedValue);
     ref<Expr> differs =
         NeExpr::create(leftEvent.observedValue, rightEvent.observedValue);
-    if (isFeasible(AndExpr::create(completedPrefix, differs))) {
+    // Preserve the exact witness query that localized the divergence so the
+    // emitted counterexample solves the same secret inequality and observed
+    // difference, not just the ambient state constraints.
+    ref<Expr> witnessQuery = AndExpr::create(completedPrefix, differs);
+    if (isFeasible(witnessQuery)) {
       SelfCompDivergence divergence;
       divergence.index = index;
       divergence.leftSiteId = leftEvent.siteId;
       divergence.rightSiteId = rightEvent.siteId;
+      divergence.witnessQuery = witnessQuery;
       switch (leftEvent.kind) {
       case SelfCompEventKind::Branch:
         divergence.kind = SelfCompDivergenceKind::BranchSideChannel;
@@ -5072,25 +5077,20 @@ bool Executor::writeSelfCompCounterexampleKTest(
 
 bool Executor::getSelfCompCounterexampleSolution(
     const ExecutionState &state,
+    const ref<Expr> &witnessQuery,
     std::vector<std::pair<std::string, std::vector<unsigned char>>> &res) {
   // Self-composition counterexample KTests need both the original symbolic
   // objects and their primed secret twins. The generic getSymbolicSolution()
   // path only serializes state.symbolics, which is correct for normal test
   // cases but drops exp__prime-style assignments from divergence artifacts.
+  // Solve the localized witness query directly so the recorded KTest still
+  // reproduces the divergence that findDivergences() proved feasible.
   solver->setTimeout(coreSolverTimeout);
 
-  ConstraintSet extendedConstraints(state.constraints);
+  ConstraintSet extendedConstraints;
   ConstraintManager cm(extendedConstraints);
-
-  for (auto &pi : state.cexPreferences) {
-    bool mustBeTrue;
-    bool success = solver->mustBeTrue(
-        extendedConstraints, Expr::createIsZero(pi), mustBeTrue,
-        state.queryMetaData);
-    if (!success)
-      break;
-    if (!mustBeTrue)
-      cm.addConstraint(pi);
+  if (!witnessQuery.isNull()) {
+    cm.addConstraint(witnessQuery);
   }
 
   std::vector<const Array *> objects;
@@ -5120,7 +5120,7 @@ bool Executor::getSelfCompCounterexampleSolution(
   solver->setTimeout(time::Span());
   if (!success) {
     klee_warning("unable to compute initial values (invalid constraints?)!");
-    ExprPPrinter::printQuery(llvm::errs(), state.constraints,
+    ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
                              ConstantExpr::alloc(0, Expr::Bool));
     return false;
   }
@@ -5208,7 +5208,8 @@ void Executor::logSelfCompDivergence(ExecutionState &state,
   klee_message_to_file((filePrefix + " %s").c_str(), record.str().c_str());
 
   std::vector<std::pair<std::string, std::vector<unsigned char>>> assignments;
-  if (getSelfCompCounterexampleSolution(state, assignments)) {
+  if (getSelfCompCounterexampleSolution(state, divergence.witnessQuery,
+                                        assignments)) {
     writeSelfCompCounterexampleKTest(
         assignments,
         ktestPrefix + std::to_string(divergence.leftSiteId) + ".ktest");

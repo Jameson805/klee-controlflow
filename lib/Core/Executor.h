@@ -113,6 +113,8 @@ struct SelfCompDivergence {
   unsigned index{0};
   std::uint64_t leftSiteId{0};
   std::uint64_t rightSiteId{0};
+  /// Feasible localized witness used when materializing a divergence KTest.
+  ref<Expr> witnessQuery;
 };
 
 /// \todo Add a context object to keep track of data only live
@@ -573,8 +575,9 @@ private:
                                                   ExecutionState &state);
   std::string formatSelfCompDivergence(const SelfCompDivergence &divergence) const;
   const InstructionInfo *findSelfCompInstructionInfo(std::uint64_t siteId) const;
-    bool getSelfCompCounterexampleSolution(
-      const ExecutionState &state,
+  /// Materialize a divergence witness with both original and primed symbolic objects.
+  bool getSelfCompCounterexampleSolution(
+      const ExecutionState &state, const ref<Expr> &witnessQuery,
       std::vector<std::pair<std::string, std::vector<unsigned char>>> &res);
   bool writeSelfCompCounterexampleKTest(
       const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,
