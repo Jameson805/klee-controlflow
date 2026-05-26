@@ -981,63 +981,22 @@ void Executor::branch(ExecutionState &state,
       addConstraint(*result[i], conditions[i]);
 }
 
-ref<Expr>
-Executor::materializeConstraints(const ConstraintSet &constraints) const {
-  ref<Expr> result = ConstantExpr::alloc(1, Expr::Bool);
-  for (const auto &constraint : constraints) {
-    result = AndExpr::create(result, constraint);
-  }
-  return result;
-}
-
-// Self-composition compares one completed trace against either its primed copy
-// or an earlier completed trace. Each event stores the path constraints that
-// held immediately before it, and the comparison below asks a target-centered
-// question at every aligned index: can all earlier observations stay equal,
-// can this exact completed-trace pair still be realized, and can the current
-// observation differ? Only those witnesses are reported as localized findings.
-ref<Expr> Executor::buildSecretInequality(const ExecutionState &state) const {
-  ref<Expr> secretInequality = ConstantExpr::alloc(0, Expr::Bool);
-
-  for (const auto &symbolic : state.symbolics) {
-    const Array *array = symbolic.second;
-    if (!array->isSecret) {
-      continue;
-    }
-
-    auto itPrime = prime.find(array->name);
-    if (itPrime == prime.end()) {
-      continue;
-    }
-
-    UpdateList originalUpdates(array, nullptr);
-    UpdateList primedUpdates(itPrime->second, nullptr);
-    for (std::uint64_t index = 0; index < array->size; ++index) {
-      ref<Expr> idx = ConstantExpr::create(index, array->domain);
-      ref<Expr> differs = NeExpr::create(ReadExpr::create(originalUpdates, idx),
-                                         ReadExpr::create(primedUpdates, idx));
-      secretInequality = OrExpr::create(secretInequality, differs);
-    }
-  }
-
-  return secretInequality;
-}
-
 void Executor::recordBranchEvent(ExecutionState &state, KInstruction *ki,
-                                 ref<Expr> prefixCondition, bool taken) {
+                                 std::size_t prefixConstraintIndex,
+                                 bool taken) {
   state.selfCompTrace.push_back(SelfCompEvent{
-      SelfCompEventKind::Branch, ki->info->id, prefixCondition,
+      SelfCompEventKind::Branch, ki->info->id, prefixConstraintIndex,
       ConstantExpr::alloc(taken, Expr::Bool)});
 }
 
 void Executor::recordMemoryEvent(ExecutionState &state, KInstruction *target,
-                 ref<Expr> prefixCondition, bool isWrite,
+                 std::size_t prefixConstraintIndex, bool isWrite,
                  ref<Expr> address) {
   const KInstruction *site = target ? target : state.prevPC;
   assert(site && "memory event requires instruction site");
   state.selfCompTrace.push_back(SelfCompEvent{
     isWrite ? SelfCompEventKind::MemoryStore : SelfCompEventKind::MemoryLoad,
-    site->info->id, prefixCondition, address});
+    site->info->id, prefixConstraintIndex, address});
 }
 
 ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
@@ -2284,8 +2243,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       assert(bi->getCondition() == bi->getOperand(0) &&
              "Wrong operand index!");
         ref<Expr> cond = eval(ki, 0, state).value;
-        ref<Expr> branchPrefixCondition =
-          materializeConstraints(state.constraints);
+        std::size_t branchPrefixConstraintIndex = state.constraints.size();
 
       cond = optimizer.optimizeExpr(cond, false);
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
@@ -2298,9 +2256,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         statsTracker->markBranchVisited(branches.first, branches.second);
 
       if (branches.first)
-        recordBranchEvent(*branches.first, ki, branchPrefixCondition, true);
+        recordBranchEvent(*branches.first, ki, branchPrefixConstraintIndex,
+                          true);
       if (branches.second)
-        recordBranchEvent(*branches.second, ki, branchPrefixCondition, false);
+        recordBranchEvent(*branches.second, ki, branchPrefixConstraintIndex,
+                          false);
 
       if (branches.first)
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
@@ -4559,7 +4519,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
       if (inBounds) {
         const ObjectState *os = op.second;
-        ref<Expr> prefixCondition = materializeConstraints(state.constraints);
+        std::size_t prefixConstraintIndex = state.constraints.size();
         if (isWrite) {
           if (os->readOnly) {
             terminateStateOnProgramError(state, "memory error: object read only",
@@ -4567,7 +4527,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
           } else {
             ObjectState *wos = state.addressSpace.getWriteable(mo, os);
             wos->write(offset, value);
-            recordMemoryEvent(state, target, prefixCondition, true, address);
+            recordMemoryEvent(state, target, prefixConstraintIndex, true,
+                              address);
           }
         } else {
           ref<Expr> result = os->read(offset, type);
@@ -4576,7 +4537,8 @@ void Executor::executeMemoryOperation(ExecutionState &state,
             result = replaceReadWithSymbolic(state, result);
 
           bindLocal(target, state, result);
-          recordMemoryEvent(state, target, prefixCondition, false, address);
+          recordMemoryEvent(state, target, prefixConstraintIndex, false,
+                            address);
         }
 
         return;
@@ -4612,7 +4574,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
     // bound can be 0 on failure or overlapped 
     if (bound) {
-      ref<Expr> prefixCondition = materializeConstraints(bound->constraints);
+      std::size_t prefixConstraintIndex = bound->constraints.size();
       if (isWrite) {
         if (os->readOnly) {
           terminateStateOnProgramError(*bound, "memory error: object read only",
@@ -4620,12 +4582,14 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         } else {
           ObjectState *wos = bound->addressSpace.getWriteable(mo, os);
           wos->write(mo->getOffsetExpr(address), value);
-          recordMemoryEvent(*bound, target, prefixCondition, true, address);
+          recordMemoryEvent(*bound, target, prefixConstraintIndex, true,
+                            address);
         }
       } else {
         ref<Expr> result = os->read(mo->getOffsetExpr(address), type);
         bindLocal(target, *bound, result);
-        recordMemoryEvent(*bound, target, prefixCondition, false, address);
+        recordMemoryEvent(*bound, target, prefixConstraintIndex, false,
+                          address);
       }
     }
 
@@ -4841,6 +4805,20 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e) {
   return helper(e);
 }
 
+std::pair<bool, ConstraintSet>
+Executor::renameSecret(const ConstraintSet &constraints) {
+  bool changed = false;
+  ConstraintSet renamed;
+
+  for (const auto &constraint : constraints) {
+    auto [constraintChanged, renamedConstraint] = renameSecret(constraint);
+    changed = changed || constraintChanged;
+    renamed.push_back(renamedConstraint);
+  }
+
+  return {changed, renamed};
+}
+
 std::pair<bool, CompletedTrace>
 Executor::renameSecret(const CompletedTrace &trace) {
   bool changed = false;
@@ -4848,17 +4826,46 @@ Executor::renameSecret(const CompletedTrace &trace) {
   renamed.events.reserve(trace.events.size());
 
   for (const auto &event : trace.events) {
-    auto [prefixChanged, renamedPrefix] = renameSecret(event.prefixCondition);
     auto [valueChanged, renamedValue] = renameSecret(event.observedValue);
-    changed = changed || prefixChanged || valueChanged;
+    changed = changed || valueChanged;
     renamed.events.push_back(SelfCompEvent{event.kind, event.siteId,
-                                           renamedPrefix, renamedValue});
+                                           event.prefixConstraintIndex,
+                                           renamedValue});
   }
 
-  auto [pathChanged, renamedPath] = renameSecret(trace.finalPathCondition);
+  auto [pathChanged, renamedPath] = renameSecret(trace.pathConstraints);
   changed = changed || pathChanged;
-  renamed.finalPathCondition = renamedPath;
+  renamed.pathConstraints = std::move(renamedPath);
   return {changed, renamed};
+}
+
+// Self-composition now keeps one completed-path ConstraintSet per trace and
+// records only the prefix length that was active at each event. Divergence
+// solving extends one accumulated relational prefix as it walks aligned events,
+// asks whether earlier observations can stay equal, and then checks whether
+// the current branch decision or memory address can differ under those prefix
+// constraints. This keeps the hot execution path from materializing one giant
+// And-expression for every recorded event while still preserving the event
+// prefixes needed for localized witnesses.
+static void appendConstraintSlice(ConstraintSet &target,
+                                  const ConstraintSet &source,
+                                  std::size_t begin,
+                                  std::size_t end) {
+  // The recorded prefix index comes from the live state before later solver
+  // simplification/renaming touches the completed trace. Clamp to the actual
+  // stored constraint count so old indices still refer to the longest prefix
+  // that survived into the completed trace representation.
+  begin = std::min(begin, source.size());
+  end = std::min(end, source.size());
+  assert(begin <= end && "invalid constraint slice");
+
+  auto it = source.begin();
+  std::advance(it, begin);
+  auto ie = source.begin();
+  std::advance(ie, end);
+  for (; it != ie; ++it) {
+    target.push_back(*it);
+  }
 }
 
 std::vector<SelfCompDivergence>
@@ -4866,34 +4873,36 @@ Executor::findDivergences(const CompletedTrace &left,
                           const CompletedTrace &right,
                           ExecutionState &state) {
   std::vector<SelfCompDivergence> divergences;
-  ref<Expr> secretInequality = buildSecretInequality(state);
-  if (secretInequality->isFalse()) {
-    return divergences;
-  }
-  ref<Expr> completedPair =
-      AndExpr::create(left.finalPathCondition, right.finalPathCondition);
-
-  ConstraintSet noConstraints;
-  auto isFeasible = [&](const ref<Expr> &query) {
+  ConstraintSet matchedPrefixConstraints;
+  std::size_t leftAppliedConstraints = 0;
+  std::size_t rightAppliedConstraints = 0;
+  auto extendPrefixConstraints = [&](const ConstraintSet &source,
+                                     std::size_t &appliedConstraints,
+                                     std::size_t targetCount) {
+    appendConstraintSlice(matchedPrefixConstraints, source, appliedConstraints,
+                          targetCount);
+    appliedConstraints = targetCount;
+  };
+  auto isFeasible = [&](const ConstraintSet &constraints,
+                        const ref<Expr> &query) {
     bool result = false;
-    bool success = solver->mayBeTrue(noConstraints, query, result,
+    bool success = solver->mayBeTrue(constraints, query, result,
                                      state.queryMetaData);
     assert(success && "FIXME: Unhandled solver failure");
     return result;
   };
-
-  ref<Expr> matchedPrefix = secretInequality;
+  ref<Expr> trueExpr = ConstantExpr::alloc(1, Expr::Bool);
   unsigned index = 0;
   for (; index < left.events.size() && index < right.events.size(); ++index) {
     const auto &leftEvent = left.events[index];
     const auto &rightEvent = right.events[index];
 
-    ref<Expr> relationalPrefix = AndExpr::create(
-        matchedPrefix,
-        AndExpr::create(leftEvent.prefixCondition, rightEvent.prefixCondition));
-    ref<Expr> completedPrefix =
-        AndExpr::create(relationalPrefix, completedPair);
-    if (!isFeasible(completedPrefix)) {
+    extendPrefixConstraints(left.pathConstraints, leftAppliedConstraints,
+                            leftEvent.prefixConstraintIndex);
+    extendPrefixConstraints(right.pathConstraints, rightAppliedConstraints,
+                            rightEvent.prefixConstraintIndex);
+
+    if (!isFeasible(matchedPrefixConstraints, trueExpr)) {
       SelfCompDivergence divergence;
       divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
       divergence.index = index;
@@ -4927,16 +4936,13 @@ Executor::findDivergences(const CompletedTrace &left,
         EqExpr::create(leftEvent.observedValue, rightEvent.observedValue);
     ref<Expr> differs =
         NeExpr::create(leftEvent.observedValue, rightEvent.observedValue);
-    // Preserve the exact witness query that localized the divergence so the
-    // emitted counterexample solves the same secret inequality and observed
-    // difference, not just the ambient state constraints.
-    ref<Expr> witnessQuery = AndExpr::create(completedPrefix, differs);
-    if (isFeasible(witnessQuery)) {
+    if (isFeasible(matchedPrefixConstraints, differs)) {
       SelfCompDivergence divergence;
       divergence.index = index;
       divergence.leftSiteId = leftEvent.siteId;
       divergence.rightSiteId = rightEvent.siteId;
-      divergence.witnessQuery = witnessQuery;
+      divergence.witnessConstraints = matchedPrefixConstraints;
+      divergence.witnessConstraints.push_back(differs);
       switch (leftEvent.kind) {
       case SelfCompEventKind::Branch:
         divergence.kind = SelfCompDivergenceKind::BranchSideChannel;
@@ -4949,29 +4955,28 @@ Executor::findDivergences(const CompletedTrace &left,
       divergences.push_back(divergence);
     }
 
-    ref<Expr> equalPrefix = AndExpr::create(relationalPrefix, equals);
-    if (!isFeasible(AndExpr::create(equalPrefix, completedPair))) {
+    if (!isFeasible(matchedPrefixConstraints, equals)) {
       return divergences;
     }
 
-    matchedPrefix = equalPrefix;
+    matchedPrefixConstraints.push_back(equals);
   }
 
   if (left.events.size() == right.events.size()) {
     return divergences;
   }
 
-  ref<Expr> leftPrefix =
-      index < left.events.size() ? left.events[index].prefixCondition
-                                 : left.finalPathCondition;
-  ref<Expr> rightPrefix =
-      index < right.events.size() ? right.events[index].prefixCondition
-                                  : right.finalPathCondition;
+  if (index < left.events.size()) {
+    extendPrefixConstraints(left.pathConstraints, leftAppliedConstraints,
+                            left.events[index].prefixConstraintIndex);
+  }
+  if (index < right.events.size()) {
+    extendPrefixConstraints(right.pathConstraints, rightAppliedConstraints,
+                            right.events[index].prefixConstraintIndex);
+  }
+
   SelfCompDivergence divergence;
-  if (!isFeasible(AndExpr::create(
-          AndExpr::create(matchedPrefix,
-                          AndExpr::create(leftPrefix, rightPrefix)),
-          completedPair))) {
+  if (!isFeasible(matchedPrefixConstraints, trueExpr)) {
     divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
   } else {
     divergence.kind = SelfCompDivergenceKind::UnlocalizableLengthMismatch;
@@ -5077,7 +5082,7 @@ bool Executor::writeSelfCompCounterexampleKTest(
 
 bool Executor::getSelfCompCounterexampleSolution(
     const ExecutionState &state,
-    const ref<Expr> &witnessQuery,
+  const ConstraintSet &witnessConstraints,
     std::vector<std::pair<std::string, std::vector<unsigned char>>> &res) {
   // Self-composition counterexample KTests need both the original symbolic
   // objects and their primed secret twins. The generic getSymbolicSolution()
@@ -5086,12 +5091,6 @@ bool Executor::getSelfCompCounterexampleSolution(
   // Solve the localized witness query directly so the recorded KTest still
   // reproduces the divergence that findDivergences() proved feasible.
   solver->setTimeout(coreSolverTimeout);
-
-  ConstraintSet extendedConstraints;
-  ConstraintManager cm(extendedConstraints);
-  if (!witnessQuery.isNull()) {
-    cm.addConstraint(witnessQuery);
-  }
 
   std::vector<const Array *> objects;
   std::vector<std::pair<std::string, const Array *>> namedObjects;
@@ -5115,13 +5114,13 @@ bool Executor::getSelfCompCounterexampleSolution(
   }
 
   std::vector<std::vector<unsigned char>> values;
-  bool success = solver->getInitialValues(extendedConstraints, objects, values,
+  bool success = solver->getInitialValues(witnessConstraints, objects, values,
                                           state.queryMetaData);
   solver->setTimeout(time::Span());
   if (!success) {
     klee_warning("unable to compute initial values (invalid constraints?)!");
-    ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
-                             ConstantExpr::alloc(0, Expr::Bool));
+    ExprPPrinter::printQuery(llvm::errs(), witnessConstraints,
+                             ConstantExpr::alloc(1, Expr::Bool));
     return false;
   }
 
@@ -5208,7 +5207,7 @@ void Executor::logSelfCompDivergence(ExecutionState &state,
   klee_message_to_file((filePrefix + " %s").c_str(), record.str().c_str());
 
   std::vector<std::pair<std::string, std::vector<unsigned char>>> assignments;
-  if (getSelfCompCounterexampleSolution(state, divergence.witnessQuery,
+  if (getSelfCompCounterexampleSolution(state, divergence.witnessConstraints,
                                         assignments)) {
     writeSelfCompCounterexampleKTest(
         assignments,
@@ -5217,8 +5216,7 @@ void Executor::logSelfCompDivergence(ExecutionState &state,
 }
 
 std::string Executor::compareAgainstCompletedTraces(ExecutionState &state) {
-  CompletedTrace current{state.selfCompTrace,
-                         materializeConstraints(state.constraints)};
+  CompletedTrace current{state.selfCompTrace, state.constraints};
   std::string message;
   std::set<std::string> reportedMessages;
 

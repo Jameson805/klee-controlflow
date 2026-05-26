@@ -99,12 +99,12 @@ enum class SelfCompDivergenceKind {
   MemorySideChannel,
 };
 
-/// A finished observable trace plus the full path condition needed to ensure a
-/// reported divergence is compatible with the exact completed executions being
-/// compared.
+/// A finished observable trace plus the path constraints accumulated along the
+/// completed execution. Individual events refer into this constraint list via
+/// prefix indices instead of storing duplicated materialized path conditions.
 struct CompletedTrace {
   std::vector<SelfCompEvent> events;
-  ref<Expr> finalPathCondition;
+  ConstraintSet pathConstraints;
 };
 
 /// Result of checking one aligned trace index under self-composition.
@@ -114,7 +114,7 @@ struct SelfCompDivergence {
   std::uint64_t leftSiteId{0};
   std::uint64_t rightSiteId{0};
   /// Feasible localized witness used when materializing a divergence KTest.
-  ref<Expr> witnessQuery;
+  ConstraintSet witnessConstraints;
 };
 
 /// \todo Add a context object to keep track of data only live
@@ -558,18 +558,17 @@ private:
   void dumpExecutionTree();
 
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
+  std::pair<bool, ConstraintSet> renameSecret(const ConstraintSet &constraints);
   std::pair<bool, CompletedTrace> renameSecret(const CompletedTrace &trace);
-  ref<Expr> materializeConstraints(const ConstraintSet &constraints) const;
-  ref<Expr> buildSecretInequality(const ExecutionState &state) const;
   void recordBranchEvent(ExecutionState &state, KInstruction *ki,
-                         ref<Expr> prefixCondition, bool taken);
+                         std::size_t prefixConstraintIndex, bool taken);
   void recordMemoryEvent(ExecutionState &state, KInstruction *target,
-                         ref<Expr> prefixCondition, bool isWrite,
+                         std::size_t prefixConstraintIndex, bool isWrite,
                          ref<Expr> address);
   /// Compare two completed traces under secret renaming.
   /// For each aligned site, this asks whether all earlier observations can be
-  /// kept equal while the current observation diverges, and it only reports a
-  /// site when that witness is compatible with both completed trace suffixes.
+  /// kept equal while the current observation diverges under the two event
+  /// prefixes accumulated so far.
   std::vector<SelfCompDivergence> findDivergences(const CompletedTrace &left,
                                                   const CompletedTrace &right,
                                                   ExecutionState &state);
@@ -577,7 +576,7 @@ private:
   const InstructionInfo *findSelfCompInstructionInfo(std::uint64_t siteId) const;
   /// Materialize a divergence witness with both original and primed symbolic objects.
   bool getSelfCompCounterexampleSolution(
-      const ExecutionState &state, const ref<Expr> &witnessQuery,
+      const ExecutionState &state, const ConstraintSet &witnessConstraints,
       std::vector<std::pair<std::string, std::vector<unsigned char>>> &res);
   bool writeSelfCompCounterexampleKTest(
       const std::vector<std::pair<std::string, std::vector<unsigned char>>> &out,

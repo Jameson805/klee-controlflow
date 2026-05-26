@@ -50,13 +50,14 @@ enum class SelfCompEventKind {
 };
 
 /// One observable step in the trace used for relational comparison.
-/// `prefixCondition` captures the path constraints immediately before the
-/// event, and `observedValue` stores the branch decision or memory address
-/// whose equality/divergence is checked later in Executor.
+/// `prefixConstraintIndex` marks how many constraints from the completed
+/// trace's path constraint list were active immediately before the event, and
+/// `observedValue` stores the branch decision or memory address whose
+/// equality/divergence is checked later in Executor.
 struct SelfCompEvent {
   SelfCompEventKind kind;
   std::uint64_t siteId;
-  ref<Expr> prefixCondition;
+  std::size_t prefixConstraintIndex;
   ref<Expr> observedValue;
 };
 
