@@ -983,10 +983,12 @@ void Executor::branch(ExecutionState &state,
 
 void Executor::recordBranchEvent(ExecutionState &state, KInstruction *ki,
                                  std::size_t prefixConstraintIndex,
-                                 bool taken) {
+                 ref<Expr> condition,
+                 bool taken) {
+  (void)taken;
   state.selfCompTrace.push_back(SelfCompEvent{
       SelfCompEventKind::Branch, ki->info->id, prefixConstraintIndex,
-      ConstantExpr::alloc(taken, Expr::Bool)});
+    condition});
 }
 
 void Executor::recordMemoryEvent(ExecutionState &state, KInstruction *target,
@@ -997,6 +999,33 @@ void Executor::recordMemoryEvent(ExecutionState &state, KInstruction *target,
   state.selfCompTrace.push_back(SelfCompEvent{
     isWrite ? SelfCompEventKind::MemoryStore : SelfCompEventKind::MemoryLoad,
     site->info->id, prefixConstraintIndex, address});
+}
+
+ref<Expr> Executor::buildSecretInequality(const ExecutionState &state) const {
+  ref<Expr> secretInequality = ConstantExpr::alloc(0, Expr::Bool);
+
+  for (const auto &symbolic : state.symbolics) {
+    const Array *array = symbolic.second;
+    if (!array->isSecret) {
+      continue;
+    }
+
+    auto itPrime = prime.find(array->name);
+    if (itPrime == prime.end()) {
+      continue;
+    }
+
+    UpdateList originalUpdates(array, nullptr);
+    UpdateList primedUpdates(itPrime->second, nullptr);
+    for (std::uint64_t index = 0; index < array->size; ++index) {
+      ref<Expr> idx = ConstantExpr::create(index, array->domain);
+      ref<Expr> differs = NeExpr::create(ReadExpr::create(originalUpdates, idx),
+                                         ReadExpr::create(primedUpdates, idx));
+      secretInequality = OrExpr::create(secretInequality, differs);
+    }
+  }
+
+  return secretInequality;
 }
 
 ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
@@ -2257,10 +2286,10 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
       if (branches.first)
         recordBranchEvent(*branches.first, ki, branchPrefixConstraintIndex,
-                          true);
+                          cond, true);
       if (branches.second)
         recordBranchEvent(*branches.second, ki, branchPrefixConstraintIndex,
-                          false);
+                          cond, false);
 
       if (branches.first)
         transferToBasicBlock(bi->getSuccessor(0), bi->getParent(), *branches.first);
@@ -4873,7 +4902,12 @@ Executor::findDivergences(const CompletedTrace &left,
                           const CompletedTrace &right,
                           ExecutionState &state) {
   std::vector<SelfCompDivergence> divergences;
+  ref<Expr> secretInequality = buildSecretInequality(state);
+  if (secretInequality->isFalse()) {
+    return divergences;
+  }
   ConstraintSet matchedPrefixConstraints;
+  matchedPrefixConstraints.push_back(secretInequality);
   std::size_t leftAppliedConstraints = 0;
   std::size_t rightAppliedConstraints = 0;
   auto extendPrefixConstraints = [&](const ConstraintSet &source,

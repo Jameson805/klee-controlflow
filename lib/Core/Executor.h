@@ -560,8 +560,10 @@ private:
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
   std::pair<bool, ConstraintSet> renameSecret(const ConstraintSet &constraints);
   std::pair<bool, CompletedTrace> renameSecret(const CompletedTrace &trace);
+  ref<Expr> buildSecretInequality(const ExecutionState &state) const;
   void recordBranchEvent(ExecutionState &state, KInstruction *ki,
-                         std::size_t prefixConstraintIndex, bool taken);
+                         std::size_t prefixConstraintIndex,
+                         ref<Expr> condition, bool taken);
   void recordMemoryEvent(ExecutionState &state, KInstruction *target,
                          std::size_t prefixConstraintIndex, bool isWrite,
                          ref<Expr> address);
