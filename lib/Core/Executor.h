@@ -73,6 +73,7 @@ class KModule;
 class MemoryManager;
 class MemoryObject;
 class ObjectState;
+class UpdateNode;
 class ExecutionTree;
 class Searcher;
 class SeedInfo;
@@ -194,6 +195,31 @@ private:
   /// NEW: Map from secret symbolic name to their prime (') copy
   /// NOTE: This requires all symbolic names to be unique
   std::map<std::string, const Array*> prime;
+
+  /// Cache entry for renameSecret(expr).
+  /// original pins the source node so the raw-pointer key stays valid while
+  /// cached; changed/renamed mirror renameSecret()'s return value.
+  struct RenameSecretExprCacheEntry {
+    ref<Expr> original;
+    bool changed;
+    ref<Expr> renamed;
+  };
+
+  /// Cache entry for renameSecret() over update-list nodes.
+  /// original is retained only for lifetime safety of the pointer key.
+  struct RenameSecretUpdateCacheEntry {
+    ref<UpdateNode> original;
+    bool changed;
+    ref<UpdateNode> renamed;
+  };
+
+  /// Cache for syntactic secret-to-prime expression renaming.
+  /// The maps are keyed by raw pointer for fast identity lookup, while each
+  /// entry keeps a strong ref to the original node so that address cannot be
+  /// freed and reused for a different node while cached. The cache is cleared
+  /// when a new secret prime array is created.
+  std::unordered_map<const Expr *, RenameSecretExprCacheEntry> renameSecretCache;
+  std::unordered_map<const UpdateNode *, RenameSecretUpdateCacheEntry> renameSecretUpdateCache;
 
   /// File to print executed instructions to
   std::unique_ptr<llvm::raw_ostream> debugInstFile;
@@ -519,13 +545,54 @@ private:
   void dumpStates();
   void dumpExecutionTree();
 
-  // Rename all secret symbolics in expression to their prime counterpart
-  // Pair of (does it contain secret, renamed expression)
+  // Rename all secret symbolics in an expression to their prime counterpart.
+  // Returns (containsSecret, renamedExpr). CT checking uses this to build the
+  // relational "same public inputs, different secret inputs" query.
   std::pair<bool, ref<Expr>> renameSecret(const ref<Expr> &e);
 
+  /// Concrete byte assignments emitted in counterexample reports and ktests.
   using Assignments = std::vector<std::pair<std::string, std::vector<unsigned char>>>;
+
+  /// Evaluate expr under a fully concrete assignment and return its boolean
+  /// value. This requires evaluation to produce a concrete Bool; otherwise the
+  /// executor stops with an error.
+  bool evaluateAssignmentAsBool(const Assignment &assignment, const ref<Expr> &expr) const;
+
+  /// Return true when assignment satisfies every constraint in constraints.
+  /// This is the basic validity check for state-local concrete models and for
+  /// candidate assignments tried by CV/model-directed optimizations.
+  bool assignmentSatisfies(const Assignment &assignment, const ConstraintSet &constraints) const;
+
+  /// Return the constraints used by CT witness checks: original path
+  /// constraints plus the renamed relational side tracked on the state.
+  ConstraintSet constraintsWithRenamed(const ExecutionState &state) const;
+
+  /// Result of searching for one concrete assignment over a requested object
+  /// set. Unsat means the requested side was proved impossible; Error means
+  /// solver/model extraction failed before that conclusion was available.
+  enum class CandidateAssignmentResult { Found, Unsat, Error };
+
+  /// Try fixed and random candidate assignments before asking the solver for
+  /// the arrays named by candidateObjects under expr == desiredValue. The
+  /// warning string must be non-null.
+  CandidateAssignmentResult findCandidateAssignment(
+      const ExecutionState &state, const Assignment &baseAssignment,
+      const std::vector<const Array *> &candidateObjects,
+      const ConstraintSet &baseConstraints,
+      const ref<Expr> &expr, bool desiredValue,
+      const char *warning, Assignment &assignment);
+
+  /// Main CT witness entrypoint for one branch or memory expression. It builds
+  /// the renamed secret-side expression, tries the concrete chosen-value path
+  /// inline, and falls back to the existing solver-backed counterexample
+  /// query.
   bool getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond);
+
+  /// Run CT checking for cond at the current instruction, report the result,
+  /// and write any generated witness as a test case under outputDir.
   bool checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond);
+
+  /// Write one emitted counterexample assignment set as a ktest file.
   bool writeTestCaseKTest(const Assignments &out, const std::string &testName);
 
 public:

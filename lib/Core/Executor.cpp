@@ -101,6 +101,7 @@ using namespace llvm;
 using namespace klee;
 
 namespace klee {
+
 cl::OptionCategory DebugCat("Debugging options",
                             "These are debugging options.");
 
@@ -180,9 +181,14 @@ cl::opt<bool>
                                   "querying the solver (default=true)"),
                          cl::cat(SolvingCat));
 
-cl::opt<bool> ConcretizeOnSolverTimeout(
-    "concretize-on-solver-timeout", cl::init(true),
-    cl::desc("Concretize public inputs on solver timeout (default=true)"),
+cl::opt<bool> UseCvModel(
+    "use-cv-model", cl::init(true),
+    cl::desc("Use the state-local concrete model for chosen-value CT checks, model-directed forks, and model repair (default=true)"),
+    cl::cat(SolvingCat));
+
+cl::opt<unsigned> CvModelRandomCandidates(
+    "cv-model-random-candidates", cl::init(10),
+    cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=10)"),
     cl::cat(SolvingCat));
 
 
@@ -1051,6 +1057,96 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   if (!isSeeding)
     condition = maxStaticPctChecks(current, condition);
 
+  ConstraintSet constraintSet{current.constraints};
+  ConstraintSet renamedConstraintSet{current.renamedConstraints};
+
+  // KLEE-CF model-directed fork path: the state-local concrete model already
+  // represents one feasible continuation. Try that branch before asking the
+  // solver, then probe the opposite branch with the explicit candidate set. If
+  // no opposite candidate is found, continue the model side and record that the
+  // other side was skipped. Replay and seed modes keep the upstream solver-
+  // driven behavior because they have their own branch-selection contracts.
+  if (UseCvModel && !isSeeding && !replayPath && !replayKTest) {
+    bool modelSide = evaluateAssignmentAsBool(current.concreteModel, condition);
+    {
+      std::vector<const Array *> candidateObjects;
+      // The state-local model represents only the current execution path.
+      // Prime arrays are CT-witness inputs, not branch-feasibility inputs.
+      for (const auto &[_, array] : current.symbolics)
+        candidateObjects.push_back(array);
+
+      Assignment oppositeAssignment;
+      bool oppositeSide = !modelSide;
+      CandidateAssignmentResult oppositeResult = findCandidateAssignment(
+          current, current.concreteModel, candidateObjects,
+          current.constraints, condition, oppositeSide,
+          "get initial values failed for opposite branch",
+          oppositeAssignment);
+
+      if (oppositeResult == CandidateAssignmentResult::Found) {
+        TimerStatIncrementer timer(stats::forkTime);
+        Assignment modelAssignment = current.concreteModel;
+        ExecutionState *trueState = &current;
+        ExecutionState *falseState = current.branch();
+        addedStates.push_back(falseState);
+        ++stats::forks;
+
+        executionTree->attach(current.executionTreeNode, falseState, trueState,
+                              reason);
+        stats::incBranchStat(reason, 1);
+
+        if (pathWriter) {
+          falseState->pathOS = pathWriter->open(current.pathOS);
+          if (!isInternal) {
+            trueState->pathOS << "1";
+            falseState->pathOS << "0";
+          }
+        }
+        if (symPathWriter) {
+          falseState->symPathOS = symPathWriter->open(current.symPathOS);
+          if (!isInternal) {
+            trueState->symPathOS << "1";
+            falseState->symPathOS << "0";
+          }
+        }
+
+        trueState->constraints = constraintSet;
+        trueState->renamedConstraints = renamedConstraintSet;
+        falseState->constraints = constraintSet;
+        falseState->renamedConstraints = renamedConstraintSet;
+        if (modelSide) {
+          falseState->concreteModel = oppositeAssignment;
+        } else {
+          trueState->concreteModel = oppositeAssignment;
+          falseState->concreteModel = modelAssignment;
+        }
+
+        addConstraint(*trueState, condition);
+        addConstraint(*falseState, Expr::createIsZero(condition));
+
+        if (MaxDepth && MaxDepth <= trueState->depth) {
+          terminateStateEarly(*trueState, "max-depth exceeded.",
+                              StateTerminationType::MaxDepth);
+          terminateStateEarly(*falseState, "max-depth exceeded.",
+                              StateTerminationType::MaxDepth);
+          return StatePair(nullptr, nullptr);
+        }
+
+        return StatePair(trueState, falseState);
+      }
+
+      ++stats::deferredForks;
+      ++stats::inhibitedForks;
+      if (!isInternal && pathWriter)
+        current.pathOS << (modelSide ? "1" : "0");
+      if (!isInternal && symPathWriter)
+        current.symPathOS << (modelSide ? "1" : "0");
+      addConstraint(current, modelSide ? condition : Expr::createIsZero(condition));
+      return modelSide ? StatePair(&current, nullptr)
+                       : StatePair(nullptr, &current);
+    }
+  }
+
   time::Span timeout = coreSolverTimeout;
   if (isSeeding)
     timeout *= static_cast<unsigned>(it->second.size());
@@ -1059,112 +1155,17 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
                                   current.queryMetaData);
   solver->setTimeout(time::Span());
 
-  ConstraintSet constraintSet{current.constraints};
-
   if (!success) {
-    if (ConcretizeOnSolverTimeout) {
-      {
-        Instruction *lastInst;
-        const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
-        if (!ii.file.empty()) {
-          klee_warning("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
-        } else {
-          klee_warning("Query timed out (fork).");
-        }
-      }
-
-      // On timeout, concretize public inputs and re-solve
-      ConstraintSet csNew;
-      ConstraintManager cm{csNew};
-
-      std::vector<const Array*> objects;
-      for (unsigned i = 0; i != current.symbolics.size(); ++i)
-        objects.push_back(current.symbolics[i].second);
-      std::vector<std::vector<unsigned char>> values;
-
-      solver->setTimeout(timeout);
-      bool concretizeSuc{solver->getInitialValues(current.constraints, objects, values, current.queryMetaData)};
-      solver->setTimeout(time::Span());
-
-      if (concretizeSuc)
-      {
-        // Assign concrete values for public inputs
-        for (unsigned i{0}; i < current.symbolics.size(); ++i)
-        {
-          for (unsigned j{0}; j < current.symbolics[i].second->size; ++j)
-          {
-            if (!current.symbolics[i].second->isSecret)
-            {
-              cm.addConstraint(
-                  EqExpr::alloc(
-                    ReadExpr::alloc(UpdateList{current.symbolics[i].second, nullptr},
-                      ConstantExpr::alloc(j, current.symbolics[i].second->domain)
-                    ),
-                    ConstantExpr::alloc(values[i][j], Expr::Int8)
-                  )
-              );
-            }
-          }
-
-          // Add constraints that are undecided after concretization
-          for (ref<Expr> c : current.constraints)
-          {
-            Solver::Validity v;
-            solver->setTimeout(timeout);
-            bool success{solver->evaluate(csNew, c, v, current.queryMetaData)};
-            solver->setTimeout(time::Span());
-            if (!success)
-            {
-              current.pc = current.prevPC;
-              terminateStateOnSolverError(current, "Failed to evaluate constraint validity");
-              return StatePair(nullptr, nullptr);
-            }
-            if (v == Solver::False)
-            {
-              current.pc = current.prevPC;
-              terminateStateOnSolverError(current, "Concretized values violate path constraints");
-              return StatePair(nullptr, nullptr);
-            }
-            else if (v == Solver::Unknown)
-            {
-              cm.addConstraint(c);
-            }
-          }
-
-          solver->setTimeout(timeout);
-          bool resolveSuc{solver->evaluate(csNew, condition, res,
-                                          current.queryMetaData)};
-          solver->setTimeout(time::Span());
-          if (!resolveSuc)
-          {
-            current.pc = current.prevPC;
-            // ExprPPrinter::printQuery(llvm::errs(), csNew,
-            //                         ConstantExpr::alloc(0, Expr::Bool));
-            terminateStateOnSolverError(current, "Failed to solve path condition after concretizing fork");
-            return StatePair(nullptr, nullptr);
-          }
-        }
-      }
-      else
-      {
-        current.pc = current.prevPC;
-        // ExprPPrinter::printQuery(llvm::errs(), csNew,
-        //                         ConstantExpr::alloc(0, Expr::Bool));
-        terminateStateOnSolverError(current, "Failed to concretize fork");
-        return StatePair(nullptr, nullptr);
-      }
+    Instruction *lastInst;
+    const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
+    if (!ii.file.empty()) {
+      klee_error("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
     } else {
-      Instruction *lastInst;
-      const InstructionInfo &ii = getLastNonKleeInternalInstruction(current, &lastInst);
-      if (!ii.file.empty()) {
-        klee_error("Query timed out (fork) at %s:%d", ii.file.c_str(), ii.line);
-      } else {
-        klee_error("Query timed out (fork).");
-      }
-      current.pc = current.prevPC;
-      terminateStateOnSolverError(current, "Query timed out (fork).");
-      return StatePair(nullptr, nullptr);
+      klee_error("Query timed out (fork).");
     }
+    current.pc = current.prevPC;
+    terminateStateOnSolverError(current, "Query timed out (fork).");
+    return StatePair(nullptr, nullptr);
   }
 
   if (!isSeeding) {
@@ -1324,8 +1325,10 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     }
 
     trueState->constraints = constraintSet;
+    trueState->renamedConstraints = renamedConstraintSet;
     addConstraint(*trueState, condition);
     falseState->constraints = constraintSet;
+    falseState->renamedConstraints = renamedConstraintSet;
     addConstraint(*falseState, Expr::createIsZero(condition));
 
     // Kinda gross, do we even really still want this option?
@@ -1371,7 +1374,37 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   state.addConstraint(condition);
   // NEW: Duplicate constraint with secret symbolics replaced with primes
   auto [hasSecret, renamedCond]{renameSecret(condition)};
-  if (hasSecret) state.addConstraint(renamedCond);
+  if (hasSecret) state.addRenamedConstraint(renamedCond);
+
+  if (UseCvModel) {
+    ConstraintSet combinedConstraints = constraintsWithRenamed(state);
+    if (!assignmentSatisfies(state.concreteModel, combinedConstraints)) {
+      std::vector<const Array *> candidateObjects;
+      // Repair the concrete execution model over the state's original
+      // symbolics and prime secrets because CT checks also use renamed path
+      // constraints.
+      for (const auto &[_, array] : state.symbolics) {
+        candidateObjects.push_back(array);
+        if (!array->isSecret)
+          continue;
+
+        auto it = prime.find(array->name);
+        assert(it != prime.end() && "secret symbolic not found in prime map");
+        candidateObjects.push_back(it->second);
+      }
+
+      Assignment candidate;
+      if (findCandidateAssignment(
+              state, state.concreteModel, candidateObjects,
+            combinedConstraints, ConstantExpr::alloc(1, Expr::Bool), true,
+              "failed to repair concrete model after adding constraint",
+              candidate) == CandidateAssignmentResult::Found) {
+        state.concreteModel = candidate;
+      } else {
+        klee_error("failed to repair concrete model after adding constraint");
+      }
+    }
+  }
 
   if (ivcEnabled)
     doImpliedValueConcretization(state, condition, 
@@ -2912,9 +2945,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bool nonCt = checkLogCounterexample(NonCtType::Memory, state, ki, base);
     if (nonCt) {
       auto [hasSecret, renamedBase] = renameSecret(base);
-      if (hasSecret) {
-        state.addConstraint(EqExpr::create(base, renamedBase));
-      }
+      if (hasSecret)
+        state.addRenamedConstraint(EqExpr::create(base, renamedBase));
     }
 
     executeMemoryOperation(state, false, base, 0, ki);
@@ -2926,9 +2958,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bool nonCt = checkLogCounterexample(NonCtType::Memory, state, ki, base);
     if (nonCt) {
       auto [hasSecret, renamedBase] = renameSecret(base);
-      if (hasSecret) {
-        state.addConstraint(EqExpr::create(base, renamedBase));
-      }
+      if (hasSecret)
+        state.addRenamedConstraint(EqExpr::create(base, renamedBase));
     }
 
     ref<Expr> value = eval(ki, 0, state).value;
@@ -4318,7 +4349,7 @@ ref<Expr> Executor::replaceReadWithSymbolic(ExecutionState &state,
   ref<Expr> res = Expr::createTempRead(array, e->getWidth());
   ref<Expr> eq = NotOptimizedExpr::create(EqExpr::create(e, res));
   llvm::errs() << "Making symbolic: " << eq << "\n";
-  state.addConstraint(eq);
+  addConstraint(state, eq);
   return res;
 }
 
@@ -4753,10 +4784,16 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
 
     if (array->isSecret)
     {
-      prime[array->name] = {arrayCache.CreateArray(array->name + "__prime", array->size,
-                            array->constantValues.data(),
-                            array->constantValues.data() + array->constantValues.size(),
-                            array->domain, array->range, array->isSecret)};
+      const Array *primeArray = arrayCache.CreateArray(
+          array->name + "__prime", array->size,
+          array->constantValues.data(),
+          array->constantValues.data() + array->constantValues.size(),
+          array->domain, array->range, false);
+      prime[array->name] = {primeArray};
+      state.concreteModel.bindings[primeArray] =
+          std::vector<unsigned char>(primeArray->size, 0);
+      renameSecretCache.clear();
+      renameSecretUpdateCache.clear();
     }
     
     auto found = seedMap.find(&state);
@@ -5210,10 +5247,12 @@ void Executor::dumpStates() {
 
 std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
 {
-  // Cache to map original expressions to their renamed versions.
-  // This prevents exponential explosion on DAGs.
-  std::map<ref<Expr>, std::pair<bool, ref<Expr>>> visited;
-  std::map<const UpdateNode *, std::pair<bool, ref<UpdateNode>>> visitedUpdates;
+  // The executor-wide rename caches map original expression/update nodes to
+  // their renamed versions. This prevents repeated traversal of large
+  // expression DAGs across non-CT checks. The caches are also relied on within
+  // this traversal: do not mutate them concurrently or clear them while
+  // renameSecret() is running. KLEE execution is currently single-threaded, so
+  // that should not happen.
 
   std::function<std::pair<bool, ref<UpdateNode>>(const ref<UpdateNode> &)> helperUpdates;
   std::function<std::pair<bool, ref<Expr>>(const ref<Expr> &)> helper;
@@ -5221,8 +5260,12 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
   helperUpdates = [&](const ref<UpdateNode> &node) -> std::pair<bool, ref<UpdateNode>> {
     if (!node) return {false, nullptr};
 
-    auto it = visitedUpdates.find(node.get());
-    if (it != visitedUpdates.end()) return it->second;
+    const UpdateNode *nodeKey = node.get();
+
+    auto globalIt = renameSecretUpdateCache.find(nodeKey);
+    if (globalIt != renameSecretUpdateCache.end()) {
+      return {globalIt->second.changed, globalIt->second.renamed};
+    }
 
     auto [nextChanged, newNext] = helperUpdates(node->next);
     auto [idxChanged, newIdx] = helper(node->index);
@@ -5238,15 +5281,19 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
       res = {false, node};
     }
 
-    visitedUpdates.insert({node.get(), res});
+    renameSecretUpdateCache.insert({nodeKey, {node, res.first, res.second}});
     return res;
   };
 
   helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
     if (dyn_cast<ConstantExpr>(expr)) return {false, expr};
 
-    auto it = visited.find(expr);
-    if (it != visited.end()) return it->second;
+    const Expr *exprKey = expr.get();
+
+    auto globalIt = renameSecretCache.find(exprKey);
+    if (globalIt != renameSecretCache.end()) {
+      return {globalIt->second.changed, globalIt->second.renamed};
+    }
 
     std::pair<bool, ref<Expr>> res;
 
@@ -5304,26 +5351,283 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
       }
     }
 
-    visited.insert({expr, res});
+    renameSecretCache.insert({exprKey, {expr, res.first, res.second}});
     return res;
   };
 
   return helper(e);
 }
 
+bool Executor::evaluateAssignmentAsBool(const Assignment &assignment,
+                                        const ref<Expr> &expr) const {
+  ref<Expr> value = assignment.evaluate(expr);
+  auto constant = dyn_cast<ConstantExpr>(value);
+  if (!constant || constant->getWidth() != Expr::Bool)
+    klee_error("assignment evaluation did not produce a concrete Bool");
+  return constant->isTrue();
+}
+
+bool Executor::assignmentSatisfies(const Assignment &assignment,
+                                   const ConstraintSet &constraints) const {
+  for (const ref<Expr> &constraint : constraints) {
+    if (!evaluateAssignmentAsBool(assignment, constraint))
+      return false;
+  }
+  return true;
+}
+
+ConstraintSet Executor::constraintsWithRenamed(const ExecutionState &state) const {
+  ConstraintSet constraints{state.constraints};
+  ConstraintManager manager{constraints};
+  for (const ref<Expr> &constraint : state.renamedConstraints)
+    manager.addConstraint(constraint);
+  return constraints;
+}
+
+Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
+    const ExecutionState &state, const Assignment &baseAssignment,
+    const std::vector<const Array *> &candidateObjects,
+    const ConstraintSet &baseConstraints, const ref<Expr> &expr,
+    bool desiredValue, const char *warning, Assignment &assignment) {
+  ++stats::candidateModelQueries;
+
+  if (candidateObjects.empty()) return CandidateAssignmentResult::Unsat;
+
+#define TRY_CANDIDATE(CANDIDATE)                                             \
+  do {                                                                       \
+    if (assignmentSatisfies((CANDIDATE), baseConstraints) &&                 \
+        evaluateAssignmentAsBool((CANDIDATE), expr) == desiredValue) {       \
+      assignment = (CANDIDATE);                                              \
+      ++stats::candidateModelHits;                                           \
+      return CandidateAssignmentResult::Found;                               \
+    }                                                                        \
+  } while (false)
+
+#define TRY_FIXED_CANDIDATE(BYTE_VALUE, ONE_BYTE_ONLY)                       \
+  do {                                                                       \
+    Assignment candidate = baseAssignment;                                   \
+    for (const Array *array : candidateObjects) {                            \
+      std::vector<unsigned char> bytes(array->size, 0x00);                   \
+      if (ONE_BYTE_ONLY) {                                                   \
+        if (!bytes.empty())                                                  \
+          bytes[0] = (BYTE_VALUE);                                           \
+      } else {                                                               \
+        std::fill(bytes.begin(), bytes.end(), (BYTE_VALUE));                 \
+      }                                                                      \
+      candidate.bindings[array] = bytes;                                     \
+    }                                                                        \
+    TRY_CANDIDATE(candidate);                                                \
+  } while (false)
+
+  // Try these fixed values first:
+  //   0, 1, -1, 0b01... (0x55), and 0b10... (0xaa).
+  // The alternating 0x55/0xaa patterns catch bit-mask and parity-like cases
+  // that all-zero/all-one values can miss.
+  TRY_FIXED_CANDIDATE(0x00, false);
+  TRY_FIXED_CANDIDATE(0x01, true);
+  TRY_FIXED_CANDIDATE(0xff, false);
+  TRY_FIXED_CANDIDATE(0x55, false);
+  TRY_FIXED_CANDIDATE(0xaa, false);
+
+  for (unsigned randomCandidate = 0; randomCandidate < CvModelRandomCandidates;
+       ++randomCandidate) {
+    Assignment candidate = baseAssignment;
+    for (const Array *array : candidateObjects) {
+      std::vector<unsigned char> bytes(array->size);
+      for (unsigned i = 0; i < array->size; ++i)
+        bytes[i] = static_cast<unsigned char>(theRNG.getInt32() & 0xffU);
+      candidate.bindings[array] = bytes;
+    }
+
+    TRY_CANDIDATE(candidate);
+  }
+
+#undef TRY_FIXED_CANDIDATE
+#undef TRY_CANDIDATE
+
+  // Candidate probing failed, so solve the same request. The solver fills only
+  // the candidate-bound arrays into baseAssignment, preserving values that this
+  // fallback level intentionally fixed.
+  ConstraintSet solverConstraints{baseConstraints};
+  ConstraintManager manager{solverConstraints};
+  ref<Expr> solverExpr = ConstraintManager::simplifyExpr(
+      solverConstraints, desiredValue ? expr : Expr::createIsZero(expr));
+  if (solverExpr->isFalse())
+    return CandidateAssignmentResult::Unsat;
+  if (!solverExpr->isTrue()) {
+    solver->setTimeout(coreSolverTimeout);
+    Solver::Validity validity;
+    bool success{solver->evaluate(solverConstraints, solverExpr, validity,
+                                  state.queryMetaData)};
+    solver->setTimeout(time::Span());
+    if (!success) {
+      klee_warning("%s", warning);
+      ExprPPrinter::printQuery(llvm::errs(), solverConstraints, solverExpr);
+      return CandidateAssignmentResult::Error;
+    }
+    if (validity == Solver::False)
+      return CandidateAssignmentResult::Unsat;
+    if (validity != Solver::True)
+      manager.addConstraint(solverExpr);
+  }
+
+  std::vector<std::vector<unsigned char>> values;
+  solver->setTimeout(coreSolverTimeout);
+  bool success{solver->getInitialValues(solverConstraints, candidateObjects,
+                                        values, state.queryMetaData)};
+  solver->setTimeout(time::Span());
+  if (!success) {
+    klee_warning("%s", warning);
+    ExprPPrinter::printQuery(llvm::errs(), solverConstraints,
+                             ConstantExpr::alloc(0, Expr::Bool));
+    return CandidateAssignmentResult::Error;
+  }
+
+  assignment = baseAssignment;
+  for (unsigned i{0}; i < candidateObjects.size(); ++i)
+    assignment.bindings[candidateObjects[i]] = values[i];
+  return CandidateAssignmentResult::Found;
+}
+
 bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const ExecutionState &state, const ref<Expr> &cond)
 {
-  auto [hasSecret, renamedCond]{renameSecret(cond)};
+  auto renamedSecret = renameSecret(cond);
+  bool hasSecret = renamedSecret.first;
+  ref<Expr> renamedCond = renamedSecret.second;
   if (!hasSecret) return false;
 
-  ConstraintSet extendedConstraints{state.constraints};
-  ConstraintManager cm{extendedConstraints};
+  std::vector<const Array *> originalObjects;
+  std::vector<const Array *> publicObjects;
+  std::vector<const Array *> originalSecretObjects;
+  std::vector<const Array *> primeSecretObjects;
+  for (const auto &[_, array] : state.symbolics) {
+    originalObjects.push_back(array);
+    if (!array->isSecret) {
+      publicObjects.push_back(array);
+      continue;
+    }
+
+    originalSecretObjects.push_back(array);
+    auto it = prime.find(array->name);
+    assert(it != prime.end() && "secret symbolic not found in prime map");
+    primeSecretObjects.push_back(it->second);
+  }
+
+  std::vector<const Array *> allSecretObjects{originalSecretObjects};
+  allSecretObjects.insert(allSecretObjects.end(), primeSecretObjects.begin(),
+                          primeSecretObjects.end());
+
+  std::vector<const Array *> allCtObjects{originalObjects};
+  allCtObjects.insert(allCtObjects.end(), primeSecretObjects.begin(),
+                      primeSecretObjects.end());
+
+  auto addCurrentModelConstraints = [&](ConstraintManager &manager,
+                                        const std::vector<const Array *> &arrays) {
+    for (const Array *array : arrays) {
+      auto binding = state.concreteModel.bindings.find(array);
+      if (binding == state.concreteModel.bindings.end() ||
+          binding->second.size() != array->size) {
+        klee_error("concrete model missing symbolic object binding");
+      }
+
+      for (unsigned arrayIndex = 0; arrayIndex < array->size; ++arrayIndex) {
+        manager.addConstraint(EqExpr::create(
+            ReadExpr::create(UpdateList(array, 0),
+                             ConstantExpr::alloc(arrayIndex,
+                                                 array->getDomain())),
+            ConstantExpr::alloc(binding->second[arrayIndex],
+                                array->getRange())));
+      }
+    }
+  };
+
+  ConstraintSet combinedConstraints = constraintsWithRenamed(state);
+
+  auto recordCtWitness = [&](const Assignment &candidate) {
+    if (!assignmentSatisfies(candidate, combinedConstraints))
+      return false;
+
+    ref<Expr> left = candidate.evaluate(cond);
+    ref<Expr> right = candidate.evaluate(renamedCond);
+    auto leftConstant = dyn_cast<ConstantExpr>(left);
+    auto rightConstant = dyn_cast<ConstantExpr>(right);
+    if (!leftConstant || !rightConstant ||
+        leftConstant->compareContents(*rightConstant) == 0) {
+      return false;
+    }
+
+    for (const auto &[_, array] : state.symbolics) {
+      auto it = candidate.bindings.find(array);
+      if (it != candidate.bindings.end())
+        assignments.emplace_back(array->name, it->second);
+      if (!array->isSecret)
+        continue;
+
+      auto primeIt = prime.find(array->name);
+      if (primeIt == prime.end())
+        continue;
+
+      auto bindingIt = candidate.bindings.find(primeIt->second);
+      if (bindingIt != candidate.bindings.end())
+        assignments.emplace_back(primeIt->second->name, bindingIt->second);
+    }
+    return true;
+  };
+
+  ref<Expr> divergence = NeExpr::create(cond, renamedCond);
+
+  if (UseCvModel) {
+    ConstraintSet fixedPublicConstraints{combinedConstraints};
+    ConstraintManager fixedPublicManager{fixedPublicConstraints};
+    addCurrentModelConstraints(fixedPublicManager, publicObjects);
+
+    // Stage 1: use the same divergence expression, but fix public and secret1
+    // to the current concrete model. Under those bindings/constraints, cond
+    // evaluates concretely and only the renamed secret2 side is searched.
+    // Candidate values are tried first as a cheap optimization of that solve.
+    ConstraintSet fixedOriginalConstraints{fixedPublicConstraints};
+    ConstraintManager fixedOriginalManager{fixedOriginalConstraints};
+    addCurrentModelConstraints(fixedOriginalManager, originalSecretObjects);
+    Assignment fixedOriginalWitness;
+        if (findCandidateAssignment(
+            state, state.concreteModel, primeSecretObjects,
+            fixedOriginalConstraints, divergence, true,
+            "get initial values failed for fixed original CT check",
+          fixedOriginalWitness) == CandidateAssignmentResult::Found &&
+        recordCtWitness(fixedOriginalWitness))
+      return true;
+
+    // Stage 2: keep current public fixed, then solve for secret1 and secret2.
+    // Candidate secret pairs are tried first as a cheap optimization.
+    Assignment fixedPublicWitness;
+        if (findCandidateAssignment(
+            state, state.concreteModel, allSecretObjects,
+            fixedPublicConstraints, divergence, true,
+            "get initial values failed for fixed public CT check",
+          fixedPublicWitness) == CandidateAssignmentResult::Found &&
+        recordCtWitness(fixedPublicWitness))
+      return true;
+
+    // Stage 3: try chosen public/secret1/secret2 values first, then fall back
+    // to the full symbolic solve inside findCandidateAssignment.
+    Assignment symbolicPublicWitness;
+        if (findCandidateAssignment(
+            state, state.concreteModel, allCtObjects,
+            combinedConstraints, divergence, true,
+            "get initial values failed for symbolic CT check",
+          symbolicPublicWitness) != CandidateAssignmentResult::Found)
+      return false;
+    return recordCtWitness(symbolicPublicWitness);
+  }
+
+  // Stage 3 solver path when concrete-value probing is disabled: leave public
+  // inputs symbolic and solve for a relational divergence.
+  ConstraintSet extendedConstraints{combinedConstraints};
 
   {
-    ref<Expr> c{NeExpr::create(cond, renamedCond)};
     solver->setTimeout(coreSolverTimeout);
     Solver::Validity res;
-    bool success{solver->evaluate(extendedConstraints, c, res,
+    bool success{solver->evaluate(extendedConstraints, divergence, res,
                                   state.queryMetaData)};
     solver->setTimeout(time::Span());
     if (!success)
@@ -5337,41 +5641,29 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     {
       return false;
     }
-    else if (res == Solver::Unknown)
-    {
-      cm.addConstraint(c);
-    }
   }
 
-  std::vector<const Array*> objects;
-  for (const auto &[_, a] : state.symbolics)
-  {
-    objects.push_back(a);
-    if (a->isSecret)
-    {
-      auto it = prime.find(a->name);
-      assert(it != prime.end() && "secret symbolic not found in prime map");
-      objects.push_back(it->second);
-    }
-  }
-
+  std::vector<const Array *> objects{originalObjects};
+  objects.insert(objects.end(), primeSecretObjects.begin(),
+                 primeSecretObjects.end());
+  Assignment witness;
   std::vector<std::vector<unsigned char>> values;
   solver->setTimeout(coreSolverTimeout);
   bool success{solver->getInitialValues(extendedConstraints, objects, values,
                                         state.queryMetaData)};
   solver->setTimeout(time::Span());
-  if (!success)
-  {
+  if (!success) {
     klee_warning("get initial values failed");
     ExprPPrinter::printQuery(llvm::errs(), extendedConstraints,
-                              ConstantExpr::alloc(0, Expr::Bool));
+                             ConstantExpr::alloc(0, Expr::Bool));
     return false;
   }
 
+  witness = state.concreteModel;
   for (unsigned i{0}; i < objects.size(); ++i)
-  {
-    assignments.push_back(std::make_pair(objects[i]->name, values[i]));
-  }
+    witness.bindings[objects[i]] = values[i];
+  if (!recordCtWitness(witness))
+    return false;
   return true;
 }
 

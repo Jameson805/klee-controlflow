@@ -102,10 +102,12 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     stackAllocator(state.stackAllocator),
     heapAllocator(state.heapAllocator),
     constraints(state.constraints),
+    renamedConstraints(state.renamedConstraints),
     pathOS(state.pathOS),
     symPathOS(state.symPathOS),
     coveredLines(state.coveredLines),
     symbolics(state.symbolics),
+    concreteModel(state.concreteModel),
     cexPreferences(state.cexPreferences),
     arrayNames(state.arrayNames),
     openMergeStack(state.openMergeStack),
@@ -170,6 +172,7 @@ void ExecutionState::deallocate(const MemoryObject *mo) {
 
 void ExecutionState::addSymbolic(const MemoryObject *mo, const Array *array) {
   symbolics.emplace_back(ref<const MemoryObject>(mo), array);
+  concreteModel.bindings[array] = std::vector<unsigned char>(array->size, 0);
 }
 
 /**/
@@ -227,6 +230,25 @@ bool ExecutionState::merge(const ExecutionState &b) {
   std::set_difference(bConstraints.begin(), bConstraints.end(),
                       commonConstraints.begin(), commonConstraints.end(),
                       std::inserter(bSuffix, bSuffix.end()));
+
+  std::set< ref<Expr> > aRenamedConstraints(renamedConstraints.begin(),
+                                            renamedConstraints.end());
+  std::set< ref<Expr> > bRenamedConstraints(b.renamedConstraints.begin(),
+                                            b.renamedConstraints.end());
+  std::set< ref<Expr> > commonRenamedConstraints, aRenamedSuffix,
+      bRenamedSuffix;
+  std::set_intersection(aRenamedConstraints.begin(), aRenamedConstraints.end(),
+                        bRenamedConstraints.begin(), bRenamedConstraints.end(),
+                        std::inserter(commonRenamedConstraints,
+                                      commonRenamedConstraints.begin()));
+  std::set_difference(aRenamedConstraints.begin(), aRenamedConstraints.end(),
+                      commonRenamedConstraints.begin(),
+                      commonRenamedConstraints.end(),
+                      std::inserter(aRenamedSuffix, aRenamedSuffix.end()));
+  std::set_difference(bRenamedConstraints.begin(), bRenamedConstraints.end(),
+                      commonRenamedConstraints.begin(),
+                      commonRenamedConstraints.end(),
+                      std::inserter(bRenamedSuffix, bRenamedSuffix.end()));
   if (DebugLogStateMerge) {
     llvm::errs() << "\tconstraint prefix: [";
     for (std::set<ref<Expr> >::iterator it = commonConstraints.begin(),
@@ -347,6 +369,22 @@ bool ExecutionState::merge(const ExecutionState &b) {
     m.addConstraint(constraint);
   m.addConstraint(OrExpr::create(inA, inB));
 
+  renamedConstraints = ConstraintSet();
+  ConstraintManager renamedManager(renamedConstraints);
+  for (const auto &constraint : commonRenamedConstraints)
+    renamedManager.addConstraint(constraint);
+  if (!aRenamedSuffix.empty() || !bRenamedSuffix.empty()) {
+    ref<Expr> renamedInA = ConstantExpr::alloc(1, Expr::Bool);
+    ref<Expr> renamedInB = ConstantExpr::alloc(1, Expr::Bool);
+    for (std::set< ref<Expr> >::iterator it = aRenamedSuffix.begin(),
+           ie = aRenamedSuffix.end(); it != ie; ++it)
+      renamedInA = AndExpr::create(renamedInA, *it);
+    for (std::set< ref<Expr> >::iterator it = bRenamedSuffix.begin(),
+           ie = bRenamedSuffix.end(); it != ie; ++it)
+      renamedInB = AndExpr::create(renamedInB, *it);
+    renamedManager.addConstraint(OrExpr::create(renamedInA, renamedInB));
+  }
+
   return true;
 }
 
@@ -390,6 +428,11 @@ void ExecutionState::dumpStack(llvm::raw_ostream &out) const {
 
 void ExecutionState::addConstraint(ref<Expr> e) {
   ConstraintManager c(constraints);
+  c.addConstraint(e, prevPC->info->id);
+}
+
+void ExecutionState::addRenamedConstraint(ref<Expr> e) {
+  ConstraintManager c(renamedConstraints);
   c.addConstraint(e, prevPC->info->id);
 }
 

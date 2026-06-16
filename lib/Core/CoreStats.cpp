@@ -14,7 +14,10 @@
 using namespace klee;
 
 Statistic stats::allocations("Allocations", "Alloc");
+Statistic stats::candidateModelQueries("CandidateModelQueries", "CandQuery");
+Statistic stats::candidateModelHits("CandidateModelHits", "CandHit");
 Statistic stats::coveredInstructions("CoveredInstructions", "Icov");
+Statistic stats::deferredForks("DeferredForks", "DefFork");
 Statistic stats::externalCalls("ExternalCalls", "ExtC");
 Statistic stats::falseBranches("FalseBranches", "Bf");
 Statistic stats::forkTime("ForkTime", "Ftime");

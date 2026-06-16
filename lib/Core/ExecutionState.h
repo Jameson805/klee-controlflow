@@ -16,6 +16,7 @@
 
 #include "klee/ADT/ImmutableSet.h"
 #include "klee/ADT/TreeStream.h"
+#include "klee/Expr/Assignment.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
 #include "klee/KDAlloc/kdalloc.h"
@@ -188,8 +189,11 @@ public:
   /// @brief Heap allocator (used with deterministic allocation)
   kdalloc::Allocator heapAllocator;
 
-  /// @brief Constraints collected so far
+  /// @brief Original path constraints collected so far
   ConstraintSet constraints;
+
+  /// @brief Renamed relational constraints used for constant-time checks
+  ConstraintSet renamedConstraints;
 
   /// Statistics and information
 
@@ -215,6 +219,9 @@ public:
   //
   // FIXME: Move to a shared list structure (not critical).
   std::vector<std::pair<ref<const MemoryObject>, const Array *>> symbolics;
+
+  /// @brief Concrete assignment known to satisfy this state's path constraints.
+  Assignment concreteModel;
 
   /// @brief A set of boolean expressions
   /// the user has requested be true of a counterexample.
@@ -281,6 +288,7 @@ public:
   void addSymbolic(const MemoryObject *mo, const Array *array);
 
   void addConstraint(ref<Expr> e);
+  void addRenamedConstraint(ref<Expr> e);
   void addCexPreference(const ref<Expr> &cond);
 
   bool merge(const ExecutionState &b);

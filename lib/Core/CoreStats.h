@@ -38,6 +38,19 @@ namespace stats {
   /// Number of inhibited forks.
   extern Statistic inhibitedForks;
 
+  /// Number of local boolean questions routed through candidate-first
+  /// assignment search.
+  extern Statistic candidateModelQueries;
+
+  /// Number of times a concrete candidate answered a local boolean question
+  /// without issuing the corresponding solver query. This includes candidate-
+  /// based CT witness detection and fork-side selection after timeout.
+  extern Statistic candidateModelHits;
+
+  /// Number of branch alternatives skipped because model-directed fork
+  /// continued only the model-supported side.
+  extern Statistic deferredForks;
+
   /// Number of states, this is a "fake" statistic used by istats, it
   /// isn't normally up-to-date.
   extern Statistic states;
