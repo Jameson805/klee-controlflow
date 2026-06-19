@@ -43,6 +43,11 @@ namespace {
                     cl::desc("Use constant arrays instead of updates when possible (default=true)\n"),
                     cl::init(true),
                     cl::cat(SolvingCat));
+
+  cl::opt<bool> OptimizeConcreteObjectStateReads(
+      "optimize-concrete-object-state-reads", cl::init(true),
+      cl::desc("Read fully concrete ObjectState byte ranges directly when possible (default=true)"),
+      cl::cat(SolvingCat));
 }
 
 /***/
@@ -475,9 +480,31 @@ ref<Expr> ObjectState::read(unsigned offset, Expr::Width width) const {
   // Otherwise, follow the slow general case.
   unsigned NumBytes = width / 8;
   assert(width == NumBytes * 8 && "Invalid width for read size!");
+
+  if (OptimizeConcreteObjectStateReads && width <= Expr::Int64) {
+    bool allConcrete = true;
+    for (unsigned i = 0; i != NumBytes; ++i) {
+      if (!isByteConcrete(offset + i)) {
+        allConcrete = false;
+        break;
+      }
+    }
+
+    if (allConcrete) {
+      uint64_t value = 0;
+      const bool littleEndian = Context::get().isLittleEndian();
+      for (unsigned i = 0; i != NumBytes; ++i) {
+        unsigned idx = littleEndian ? i : (NumBytes - i - 1);
+        value |= static_cast<uint64_t>(concreteStore[offset + idx]) << (8 * i);
+      }
+      return ConstantExpr::alloc(value, width);
+    }
+  }
+
   ref<Expr> Res(0);
+  const bool littleEndian = Context::get().isLittleEndian();
   for (unsigned i = 0; i != NumBytes; ++i) {
-    unsigned idx = Context::get().isLittleEndian() ? i : (NumBytes - i - 1);
+    unsigned idx = littleEndian ? i : (NumBytes - i - 1);
     ref<Expr> Byte = read8(offset + idx);
     Res = i ? ConcatExpr::create(Byte, Res) : Byte;
   }
