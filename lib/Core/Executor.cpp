@@ -1403,7 +1403,8 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
               candidate) == CandidateAssignmentResult::Found) {
         state.concreteModel = candidate;
       } else {
-        klee_error("failed to repair concrete model after adding constraint");
+        terminateStateOnExecError(state, "failed to repair concrete model after adding constraint");
+        return;
       }
     }
   }
