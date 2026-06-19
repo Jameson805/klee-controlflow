@@ -78,7 +78,6 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TypeSize.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1062,89 +1061,92 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
 
   // KLEE-CF model-directed fork path: the state-local concrete model already
   // represents one feasible continuation. Try that branch before asking the
-  // solver, then probe the opposite branch with the explicit candidate set. If
-  // no opposite candidate is found, continue the model side and record that the
-  // other side was skipped. Replay and seed modes keep the upstream solver-
-  // driven behavior because they have their own branch-selection contracts.
+  // solver, then probe the opposite branch with the explicit candidate set.
+  // Replay and seed modes keep the upstream solver-driven behavior because
+  // they have their own branch-selection contracts. A proved-unsat opposite
+  // side is treated as a normal one-sided continuation without recording the
+  // selected branch side; only solver/model extraction failures record the
+  // selected side and count as deferred/inhibited forks.
   if (UseCvModel && !isSeeding && !replayPath && !replayKTest) {
     bool modelSide = evaluateAssignmentAsBool(current.concreteModel, condition);
-    {
-      std::vector<const Array *> candidateObjects;
-      // The state-local model represents only the current execution path.
-      // Prime arrays are CT-witness inputs, not branch-feasibility inputs.
-      for (const auto &[_, array] : current.symbolics)
-        candidateObjects.push_back(array);
+    std::vector<const Array *> candidateObjects;
+    // The state-local model represents only the current execution path.
+    // Prime arrays are CT-witness inputs, not branch-feasibility inputs.
+    for (const auto &[_, array] : current.symbolics)
+      candidateObjects.push_back(array);
 
-      Assignment oppositeAssignment;
-      bool oppositeSide = !modelSide;
-      CandidateAssignmentResult oppositeResult = findCandidateAssignment(
-          current, current.concreteModel, candidateObjects,
-          current.constraints, condition, oppositeSide,
-          "get initial values failed for opposite branch",
-          oppositeAssignment);
+    Assignment oppositeAssignment;
+    bool oppositeSide = !modelSide;
+    CandidateAssignmentResult oppositeResult = findCandidateAssignment(
+        current, current.concreteModel, candidateObjects, current.constraints,
+        condition, oppositeSide, "get initial values failed for opposite branch",
+        oppositeAssignment);
 
-      if (oppositeResult == CandidateAssignmentResult::Found) {
-        TimerStatIncrementer timer(stats::forkTime);
-        Assignment modelAssignment = current.concreteModel;
-        ExecutionState *trueState = &current;
-        ExecutionState *falseState = current.branch();
-        addedStates.push_back(falseState);
-        ++stats::forks;
+    if (oppositeResult == CandidateAssignmentResult::Found) {
+      TimerStatIncrementer timer(stats::forkTime);
+      Assignment modelAssignment = current.concreteModel;
+      ExecutionState *trueState = &current;
+      ExecutionState *falseState = current.branch();
+      addedStates.push_back(falseState);
+      ++stats::forks;
 
-        executionTree->attach(current.executionTreeNode, falseState, trueState,
-                              reason);
-        stats::incBranchStat(reason, 1);
+      executionTree->attach(current.executionTreeNode, falseState, trueState,
+                            reason);
+      stats::incBranchStat(reason, 1);
 
-        if (pathWriter) {
-          falseState->pathOS = pathWriter->open(current.pathOS);
-          if (!isInternal) {
-            trueState->pathOS << "1";
-            falseState->pathOS << "0";
-          }
+      if (pathWriter) {
+        falseState->pathOS = pathWriter->open(current.pathOS);
+        if (!isInternal) {
+          trueState->pathOS << "1";
+          falseState->pathOS << "0";
         }
-        if (symPathWriter) {
-          falseState->symPathOS = symPathWriter->open(current.symPathOS);
-          if (!isInternal) {
-            trueState->symPathOS << "1";
-            falseState->symPathOS << "0";
-          }
+      }
+      if (symPathWriter) {
+        falseState->symPathOS = symPathWriter->open(current.symPathOS);
+        if (!isInternal) {
+          trueState->symPathOS << "1";
+          falseState->symPathOS << "0";
         }
-
-        trueState->constraints = constraintSet;
-        trueState->renamedConstraints = renamedConstraintSet;
-        falseState->constraints = constraintSet;
-        falseState->renamedConstraints = renamedConstraintSet;
-        if (modelSide) {
-          falseState->concreteModel = oppositeAssignment;
-        } else {
-          trueState->concreteModel = oppositeAssignment;
-          falseState->concreteModel = modelAssignment;
-        }
-
-        addConstraint(*trueState, condition);
-        addConstraint(*falseState, Expr::createIsZero(condition));
-
-        if (MaxDepth && MaxDepth <= trueState->depth) {
-          terminateStateEarly(*trueState, "max-depth exceeded.",
-                              StateTerminationType::MaxDepth);
-          terminateStateEarly(*falseState, "max-depth exceeded.",
-                              StateTerminationType::MaxDepth);
-          return StatePair(nullptr, nullptr);
-        }
-
-        return StatePair(trueState, falseState);
       }
 
+      trueState->constraints = constraintSet;
+      trueState->renamedConstraints = renamedConstraintSet;
+      falseState->constraints = constraintSet;
+      falseState->renamedConstraints = renamedConstraintSet;
+      if (modelSide) {
+        falseState->concreteModel = oppositeAssignment;
+      } else {
+        trueState->concreteModel = oppositeAssignment;
+        falseState->concreteModel = modelAssignment;
+      }
+
+      addConstraint(*trueState, condition);
+      addConstraint(*falseState, Expr::createIsZero(condition));
+
+      if (MaxDepth && MaxDepth <= trueState->depth) {
+        terminateStateEarly(*trueState, "max-depth exceeded.",
+                            StateTerminationType::MaxDepth);
+        terminateStateEarly(*falseState, "max-depth exceeded.",
+                            StateTerminationType::MaxDepth);
+        return StatePair(nullptr, nullptr);
+      }
+
+      return StatePair(trueState, falseState);
+    }
+
+    if (oppositeResult == CandidateAssignmentResult::Error) {
       ++stats::deferredForks;
       ++stats::inhibitedForks;
-      if (!isInternal && pathWriter)
-        current.pathOS << (modelSide ? "1" : "0");
-      if (!isInternal && symPathWriter)
-        current.symPathOS << (modelSide ? "1" : "0");
-      addConstraint(current, modelSide ? condition : Expr::createIsZero(condition));
-      return modelSide ? StatePair(&current, nullptr)
-                       : StatePair(nullptr, &current);
+      addConstraint(current,
+                    modelSide ? condition : Expr::createIsZero(condition));
     }
+
+    if (!isInternal && pathWriter)
+      current.pathOS << (modelSide ? "1" : "0");
+    if (!isInternal && symPathWriter)
+      current.symPathOS << (modelSide ? "1" : "0");
+    return modelSide ? StatePair(&current, nullptr)
+                     : StatePair(nullptr, &current);
   }
 
   time::Span timeout = coreSolverTimeout;
@@ -5249,113 +5251,163 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
 {
   // The executor-wide rename caches map original expression/update nodes to
   // their renamed versions. This prevents repeated traversal of large
-  // expression DAGs across non-CT checks. The caches are also relied on within
-  // this traversal: do not mutate them concurrently or clear them while
-  // renameSecret() is running. KLEE execution is currently single-threaded, so
-  // that should not happen.
+  // expression DAGs across non-CT checks. The traversal below is deliberately
+  // iterative: large crypto benchmarks can build very deep expression and
+  // update-list chains, and recursive renaming can overflow the native stack
+  // before the CT query reaches the solver. Expressions and update-list nodes
+  // share one explicit worklist so ReadExpr update rewriting cannot re-enter
+  // expression rewriting through helper recursion.
+  //
+  // The worklist uses post-order frames: an unexpanded frame schedules itself
+  // for rebuild, then schedules its dependencies. Expanded frames only read
+  // dependency results from renameSecretCache/renameSecretUpdateCache. This is
+  // the local invariant that keeps the traversal iterative and preserves the
+  // old recursive behavior.
 
-  std::function<std::pair<bool, ref<UpdateNode>>(const ref<UpdateNode> &)> helperUpdates;
-  std::function<std::pair<bool, ref<Expr>>(const ref<Expr> &)> helper;
+  auto cachedExprResult = [&](const ref<Expr> &expr)
+      -> std::pair<bool, ref<Expr>> {
+    if (isa<ConstantExpr>(expr))
+      return {false, expr};
 
-  helperUpdates = [&](const ref<UpdateNode> &node) -> std::pair<bool, ref<UpdateNode>> {
-    if (!node) return {false, nullptr};
-
-    const UpdateNode *nodeKey = node.get();
-
-    auto globalIt = renameSecretUpdateCache.find(nodeKey);
-    if (globalIt != renameSecretUpdateCache.end()) {
-      return {globalIt->second.changed, globalIt->second.renamed};
-    }
-
-    auto [nextChanged, newNext] = helperUpdates(node->next);
-    auto [idxChanged, newIdx] = helper(node->index);
-    auto [valChanged, newVal] = helper(node->value);
-
-    std::pair<bool, ref<UpdateNode>> res;
-    if (nextChanged || idxChanged || valChanged)
-    {
-      res = {true, ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})};
-    }
-    else
-    {
-      res = {false, node};
-    }
-
-    renameSecretUpdateCache.insert({nodeKey, {node, res.first, res.second}});
-    return res;
+    auto it = renameSecretCache.find(expr.get());
+    assert(it != renameSecretCache.end() &&
+           "renameSecret expression dependency was not processed");
+    return {it->second.changed, it->second.renamed};
   };
 
-  helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
-    if (dyn_cast<ConstantExpr>(expr)) return {false, expr};
+  auto cachedUpdateResult = [&](const ref<UpdateNode> &node)
+      -> std::pair<bool, ref<UpdateNode>> {
+    if (!node)
+      return {false, nullptr};
 
-    const Expr *exprKey = expr.get();
+    auto it = renameSecretUpdateCache.find(node.get());
+    assert(it != renameSecretUpdateCache.end() &&
+           "renameSecret update-list dependency was not processed");
+    return {it->second.changed, it->second.renamed};
+  };
 
-    auto globalIt = renameSecretCache.find(exprKey);
-    if (globalIt != renameSecretCache.end()) {
-      return {globalIt->second.changed, globalIt->second.renamed};
+  enum class RenameFrameKind { Expr, Update };
+  struct RenameFrame {
+    RenameFrameKind kind;
+    ref<Expr> expr;
+    ref<UpdateNode> update;
+    // false: discover dependencies. true: rebuild from cached dependencies.
+    bool expanded;
+  };
+
+  std::vector<RenameFrame> stack;
+  auto pushExpr = [&](const ref<Expr> &expr) {
+    if (!expr || isa<ConstantExpr>(expr) || renameSecretCache.count(expr.get()))
+      return;
+    stack.push_back({RenameFrameKind::Expr, expr, nullptr, false});
+  };
+  auto pushUpdate = [&](const ref<UpdateNode> &node) {
+    if (!node || renameSecretUpdateCache.count(node.get()))
+      return;
+    stack.push_back({RenameFrameKind::Update, nullptr, node, false});
+  };
+
+  pushExpr(e);
+  while (!stack.empty()) {
+    RenameFrame frame = stack.back();
+    stack.pop_back();
+
+    if (frame.kind == RenameFrameKind::Update) {
+      if (!frame.update)
+        continue;
+
+      const UpdateNode *nodeKey = frame.update.get();
+      if (renameSecretUpdateCache.count(nodeKey))
+        continue;
+
+      if (!frame.expanded) {
+        stack.push_back(
+            {RenameFrameKind::Update, nullptr, frame.update, true});
+        pushExpr(frame.update->value);
+        pushExpr(frame.update->index);
+        pushUpdate(frame.update->next);
+        continue;
+      }
+
+      auto [nextChanged, newNext] = cachedUpdateResult(frame.update->next);
+      auto [idxChanged, newIdx] = cachedExprResult(frame.update->index);
+      auto [valChanged, newVal] = cachedExprResult(frame.update->value);
+
+      bool changed = nextChanged || idxChanged || valChanged;
+      ref<UpdateNode> renamed = changed
+          ? ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})
+          : frame.update;
+
+      renameSecretUpdateCache.insert(
+          {nodeKey, {frame.update, changed, renamed}});
+      continue;
     }
 
-    std::pair<bool, ref<Expr>> res;
+    if (isa<ConstantExpr>(frame.expr))
+      continue;
 
-    if (auto re{dyn_cast<ReadExpr>(expr)})
-    {
-      // 1. Check if the array root itself is secret
-      const Array *root = re->updates.root;
-      const Array *newRoot = root;
+    const Expr *exprKey = frame.expr.get();
+    if (renameSecretCache.count(exprKey))
+      continue;
+
+    if (!frame.expanded) {
+      stack.push_back({RenameFrameKind::Expr, frame.expr, nullptr, true});
+
+      if (auto re = dyn_cast<ReadExpr>(frame.expr)) {
+        pushUpdate(re->updates.head);
+        pushExpr(re->index);
+      } else {
+        for (unsigned i = 0; i < frame.expr->getNumKids(); ++i)
+          pushExpr(frame.expr->getKid(i));
+      }
+      continue;
+    }
+
+    std::pair<bool, ref<Expr>> result;
+    if (auto re = dyn_cast<ReadExpr>(frame.expr)) {
+      const Array *rootArray = re->updates.root;
+      const Array *newRoot = rootArray;
       bool rootChanged = false;
 
-      if (root->isSecret)
-      {
-        auto itPrime = prime.find(root->name);
-        assert(itPrime != prime.end() && "secret symbolic not found in prime map");
+      if (rootArray->isSecret) {
+        auto itPrime = prime.find(rootArray->name);
+        assert(itPrime != prime.end() &&
+               "secret symbolic not found in prime map");
         newRoot = itPrime->second;
         rootChanged = true;
       }
 
-      // 2. Check the index of the read (e.g. A[secret_index])
-      auto [indexChanged, newIndex] = helper(re->index);
+      auto [indexChanged, newIndex] = cachedExprResult(re->index);
+      auto [updatesChanged, newHead] = cachedUpdateResult(re->updates.head);
 
-      // 3. Check the updates (e.g. A[0] = secret_value)
-      auto [updatesChanged, newHead] = helperUpdates(re->updates.head);
-
-      if (rootChanged || indexChanged || updatesChanged)
-      {
+      if (rootChanged || indexChanged || updatesChanged) {
         UpdateList newUpdates{newRoot, newHead};
-        res = {true, ReadExpr::create(newUpdates, newIndex)};
+        result = {true, ReadExpr::create(newUpdates, newIndex)};
+      } else {
+        result = {false, frame.expr};
       }
-      else
-      {
-        res = {false, expr};
-      }
-    }
-    else
-    {
-      bool hasSecret{false};
+    } else {
+      bool hasSecret = false;
       std::vector<ref<Expr>> kids;
-      kids.reserve(expr->getNumKids());
+      kids.reserve(frame.expr->getNumKids());
 
-      for (unsigned i{0}; i < expr->getNumKids(); ++i)
-      {
-        auto [h, k]{helper(expr->getKid(i))};
-        hasSecret = (hasSecret || h);
-        kids.push_back(k);
+      for (unsigned i = 0; i < frame.expr->getNumKids(); ++i) {
+        auto [kidChanged, renamedKid] =
+            cachedExprResult(frame.expr->getKid(i));
+        hasSecret = hasSecret || kidChanged;
+        kids.push_back(renamedKid);
       }
 
-      if (hasSecret)
-      {
-        res = {true, expr->rebuild(kids.data())};
-      }
-      else
-      {
-        res = {false, expr};
-      }
+      result = hasSecret
+          ? std::make_pair(true, frame.expr->rebuild(kids.data()))
+          : std::make_pair(false, frame.expr);
     }
 
-    renameSecretCache.insert({exprKey, {expr, res.first, res.second}});
-    return res;
-  };
+    renameSecretCache.insert({exprKey, {frame.expr, result.first,
+                                        result.second}});
+  }
 
-  return helper(e);
+  return cachedExprResult(e);
 }
 
 bool Executor::evaluateAssignmentAsBool(const Assignment &assignment,
@@ -5393,11 +5445,13 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
 
   if (candidateObjects.empty()) return CandidateAssignmentResult::Unsat;
 
-#define TRY_CANDIDATE(CANDIDATE)                                             \
+  Assignment candidate = baseAssignment;
+
+#define TRY_CANDIDATE()                                                      \
   do {                                                                       \
-    if (assignmentSatisfies((CANDIDATE), baseConstraints) &&                 \
-        evaluateAssignmentAsBool((CANDIDATE), expr) == desiredValue) {       \
-      assignment = (CANDIDATE);                                              \
+    if (assignmentSatisfies(candidate, baseConstraints) &&                   \
+        evaluateAssignmentAsBool(candidate, expr) == desiredValue) {         \
+      assignment = candidate;                                                \
       ++stats::candidateModelHits;                                           \
       return CandidateAssignmentResult::Found;                               \
     }                                                                        \
@@ -5405,18 +5459,17 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
 
 #define TRY_FIXED_CANDIDATE(BYTE_VALUE, ONE_BYTE_ONLY)                       \
   do {                                                                       \
-    Assignment candidate = baseAssignment;                                   \
     for (const Array *array : candidateObjects) {                            \
-      std::vector<unsigned char> bytes(array->size, 0x00);                   \
+      std::vector<unsigned char> &bytes = candidate.bindings[array];          \
+      bytes.assign(array->size, 0x00);                                       \
       if (ONE_BYTE_ONLY) {                                                   \
         if (!bytes.empty())                                                  \
           bytes[0] = (BYTE_VALUE);                                           \
       } else {                                                               \
         std::fill(bytes.begin(), bytes.end(), (BYTE_VALUE));                 \
       }                                                                      \
-      candidate.bindings[array] = bytes;                                     \
     }                                                                        \
-    TRY_CANDIDATE(candidate);                                                \
+    TRY_CANDIDATE();                                                         \
   } while (false)
 
   // Try these fixed values first:
@@ -5431,15 +5484,14 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
 
   for (unsigned randomCandidate = 0; randomCandidate < CvModelRandomCandidates;
        ++randomCandidate) {
-    Assignment candidate = baseAssignment;
     for (const Array *array : candidateObjects) {
-      std::vector<unsigned char> bytes(array->size);
+      std::vector<unsigned char> &bytes = candidate.bindings[array];
+      bytes.resize(array->size);
       for (unsigned i = 0; i < array->size; ++i)
         bytes[i] = static_cast<unsigned char>(theRNG.getInt32() & 0xffU);
-      candidate.bindings[array] = bytes;
     }
 
-    TRY_CANDIDATE(candidate);
+    TRY_CANDIDATE();
   }
 
 #undef TRY_FIXED_CANDIDATE
@@ -5452,6 +5504,18 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
   ConstraintManager manager{solverConstraints};
   ref<Expr> solverExpr = ConstraintManager::simplifyExpr(
       solverConstraints, desiredValue ? expr : Expr::createIsZero(expr));
+  auto warnCandidateAssignmentError = [&](const ref<Expr> &queryExpr) {
+    Instruction *lastInst = nullptr;
+    getLastNonKleeInternalInstruction(state, &lastInst);
+
+    static std::set<Instruction *> emittedCandidateAssignmentErrors;
+    if (!emittedCandidateAssignmentErrors.insert(lastInst).second)
+      return;
+
+    klee_warning_once(lastInst, "%s", warning);
+    ExprPPrinter::printQuery(llvm::errs(), solverConstraints, queryExpr);
+  };
+
   if (solverExpr->isFalse())
     return CandidateAssignmentResult::Unsat;
   if (!solverExpr->isTrue()) {
@@ -5461,8 +5525,7 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
                                   state.queryMetaData)};
     solver->setTimeout(time::Span());
     if (!success) {
-      klee_warning("%s", warning);
-      ExprPPrinter::printQuery(llvm::errs(), solverConstraints, solverExpr);
+      warnCandidateAssignmentError(solverExpr);
       return CandidateAssignmentResult::Error;
     }
     if (validity == Solver::False)
@@ -5477,9 +5540,7 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
                                         values, state.queryMetaData)};
   solver->setTimeout(time::Span());
   if (!success) {
-    klee_warning("%s", warning);
-    ExprPPrinter::printQuery(llvm::errs(), solverConstraints,
-                             ConstantExpr::alloc(0, Expr::Bool));
+    warnCandidateAssignmentError(ConstantExpr::alloc(0, Expr::Bool));
     return CandidateAssignmentResult::Error;
   }
 
