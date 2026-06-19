@@ -186,8 +186,8 @@ cl::opt<bool> UseCvModel(
     cl::cat(SolvingCat));
 
 cl::opt<unsigned> CvModelRandomCandidates(
-  "cv-model-random-candidates", cl::init(10),
-  cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=10)"),
+  "cv-model-random-candidates", cl::init(1),
+  cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=1)"),
     cl::cat(SolvingCat));
 
 
@@ -5485,15 +5485,11 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
     TRY_CANDIDATE();                                                         \
   } while (false)
 
-  // Try these fixed values first:
-  //   0, 1, -1, 0b01... (0x55), and 0b10... (0xaa).
-  // The alternating 0x55/0xaa patterns catch bit-mask and parity-like cases
-  // that all-zero/all-one values can miss.
-  TRY_FIXED_CANDIDATE(0x00, false);
+  // Try simple non-zero fixed values before falling back to random probing and
+  // the solver. Broader fixed patterns were measured as too sparse to justify
+  // their per-query evaluation cost on the RSA CT workload.
   TRY_FIXED_CANDIDATE(0x01, true);
   TRY_FIXED_CANDIDATE(0xff, false);
-  TRY_FIXED_CANDIDATE(0x55, false);
-  TRY_FIXED_CANDIDATE(0xaa, false);
 
   for (unsigned randomCandidate = 0; randomCandidate < CvModelRandomCandidates;
        ++randomCandidate) {
