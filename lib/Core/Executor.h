@@ -60,6 +60,8 @@ namespace llvm {
 
 namespace klee {
 class Array;
+class Assignment;
+class AssignmentEvaluator;
 struct Cell;
 class ExecutionState;
 class ExternalDispatcher;
@@ -556,11 +558,15 @@ private:
   /// Evaluate expr under a fully concrete assignment and return its boolean
   /// value. This requires evaluation to produce a concrete Bool; otherwise the
   /// executor stops with an error.
+  bool evaluateAssignmentAsBool(AssignmentEvaluator &evaluator,
+                                const ref<Expr> &expr) const;
   bool evaluateAssignmentAsBool(const Assignment &assignment, const ref<Expr> &expr) const;
 
   /// Return true when assignment satisfies every constraint in constraints.
   /// This is the basic validity check for state-local concrete models and for
   /// candidate assignments tried by CV/model-directed optimizations.
+  bool assignmentSatisfies(AssignmentEvaluator &evaluator,
+                           const ConstraintSet &constraints) const;
   bool assignmentSatisfies(const Assignment &assignment, const ConstraintSet &constraints) const;
 
   /// Return the constraints used by CT witness checks: original path

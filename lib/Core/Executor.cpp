@@ -186,8 +186,8 @@ cl::opt<bool> UseCvModel(
     cl::cat(SolvingCat));
 
 cl::opt<unsigned> CvModelRandomCandidates(
-    "cv-model-random-candidates", cl::init(10),
-    cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=10)"),
+  "cv-model-random-candidates", cl::init(10),
+  cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=10)"),
     cl::cat(SolvingCat));
 
 
@@ -5410,22 +5410,34 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e)
   return cachedExprResult(e);
 }
 
-bool Executor::evaluateAssignmentAsBool(const Assignment &assignment,
+bool Executor::evaluateAssignmentAsBool(AssignmentEvaluator &evaluator,
                                         const ref<Expr> &expr) const {
-  ref<Expr> value = assignment.evaluate(expr);
+  ref<Expr> value = evaluator.visit(expr);
   auto constant = dyn_cast<ConstantExpr>(value);
   if (!constant || constant->getWidth() != Expr::Bool)
     klee_error("assignment evaluation did not produce a concrete Bool");
   return constant->isTrue();
 }
 
-bool Executor::assignmentSatisfies(const Assignment &assignment,
+bool Executor::evaluateAssignmentAsBool(const Assignment &assignment,
+                                        const ref<Expr> &expr) const {
+  AssignmentEvaluator evaluator{assignment};
+  return evaluateAssignmentAsBool(evaluator, expr);
+}
+
+bool Executor::assignmentSatisfies(AssignmentEvaluator &evaluator,
                                    const ConstraintSet &constraints) const {
   for (const ref<Expr> &constraint : constraints) {
-    if (!evaluateAssignmentAsBool(assignment, constraint))
+    if (!evaluateAssignmentAsBool(evaluator, constraint))
       return false;
   }
   return true;
+}
+
+bool Executor::assignmentSatisfies(const Assignment &assignment,
+                                   const ConstraintSet &constraints) const {
+  AssignmentEvaluator evaluator{assignment};
+  return assignmentSatisfies(evaluator, constraints);
 }
 
 ConstraintSet Executor::constraintsWithRenamed(const ExecutionState &state) const {
@@ -5449,8 +5461,9 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
 
 #define TRY_CANDIDATE()                                                      \
   do {                                                                       \
-    if (assignmentSatisfies(candidate, baseConstraints) &&                   \
-        evaluateAssignmentAsBool(candidate, expr) == desiredValue) {         \
+    AssignmentEvaluator evaluator{candidate};                                \
+    if (assignmentSatisfies(evaluator, baseConstraints) &&                   \
+        evaluateAssignmentAsBool(evaluator, expr) == desiredValue) {         \
       assignment = candidate;                                                \
       ++stats::candidateModelHits;                                           \
       return CandidateAssignmentResult::Found;                               \
@@ -5605,11 +5618,12 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
   ConstraintSet combinedConstraints = constraintsWithRenamed(state);
 
   auto recordCtWitness = [&](const Assignment &candidate) {
-    if (!assignmentSatisfies(candidate, combinedConstraints))
+    AssignmentEvaluator evaluator{candidate};
+    if (!assignmentSatisfies(evaluator, combinedConstraints))
       return false;
 
-    ref<Expr> left = candidate.evaluate(cond);
-    ref<Expr> right = candidate.evaluate(renamedCond);
+    ref<Expr> left = evaluator.visit(cond);
+    ref<Expr> right = evaluator.visit(renamedCond);
     auto leftConstant = dyn_cast<ConstantExpr>(left);
     auto rightConstant = dyn_cast<ConstantExpr>(right);
     if (!leftConstant || !rightConstant ||
