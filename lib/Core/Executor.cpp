@@ -5513,7 +5513,7 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
       return;
 
     klee_warning_once(lastInst, "%s", warning);
-    ExprPPrinter::printQuery(llvm::errs(), solverConstraints, queryExpr);
+    // ExprPPrinter::printQuery(llvm::errs(), solverConstraints, queryExpr);
   };
 
   if (solverExpr->isFalse())
