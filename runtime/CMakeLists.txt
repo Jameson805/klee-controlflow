@@ -92,6 +92,7 @@ add_subdirectory(klee-libc)
 add_subdirectory(Fortify)
 
 set(RUNTIME_LIBRARIES
+        RuntimeExplicitBzero
         RuntimeFreestanding
         RuntimeIntrinsic
         RuntimeKLEELibc
