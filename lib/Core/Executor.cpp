@@ -4690,6 +4690,8 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
           array->constantValues.data(),
           array->constantValues.data() + array->constantValues.size(),
           array->domain, array->range, array->isSecret);
+      renameSecretCache.clear();
+      renameSecretUpdateCache.clear();
     }
     
     auto found = seedMap.find(&state);
@@ -4747,47 +4749,111 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
 }
 
 std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e) {
-  std::map<ref<Expr>, std::pair<bool, ref<Expr>>> visited;
-  std::map<const UpdateNode *, std::pair<bool, ref<UpdateNode>>> visitedUpdates;
+  // Completed self-composition traces can contain very deep expression and
+  // update-list chains. Use an explicit post-order worklist so secret renaming
+  // itself does not consume native stack before the relational query reaches
+  // the solver. The executor-wide caches also avoid repeatedly traversing the
+  // same completed expressions when later paths compare against old traces.
+  auto cachedExprResult = [&](const ref<Expr> &expr)
+      -> std::pair<bool, ref<Expr>> {
+    if (isa<ConstantExpr>(expr))
+      return {false, expr};
 
-  std::function<std::pair<bool, ref<UpdateNode>>(const ref<UpdateNode> &)> helperUpdates;
-  std::function<std::pair<bool, ref<Expr>>(const ref<Expr> &)> helper;
+    auto it = renameSecretCache.find(expr.get());
+    assert(it != renameSecretCache.end() &&
+           "renameSecret expression dependency was not processed");
+    return {it->second.changed, it->second.renamed};
+  };
 
-  helperUpdates = [&](const ref<UpdateNode> &node)
+  auto cachedUpdateResult = [&](const ref<UpdateNode> &node)
       -> std::pair<bool, ref<UpdateNode>> {
     if (!node)
       return {false, nullptr};
 
-    auto it = visitedUpdates.find(node.get());
-    if (it != visitedUpdates.end())
-      return it->second;
-
-    auto [nextChanged, newNext] = helperUpdates(node->next);
-    auto [idxChanged, newIdx] = helper(node->index);
-    auto [valChanged, newVal] = helper(node->value);
-
-    std::pair<bool, ref<UpdateNode>> result;
-    if (nextChanged || idxChanged || valChanged) {
-      result = {true, ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})};
-    } else {
-      result = {false, node};
-    }
-
-    visitedUpdates.insert({node.get(), result});
-    return result;
+    auto it = renameSecretUpdateCache.find(node.get());
+    assert(it != renameSecretUpdateCache.end() &&
+           "renameSecret update-list dependency was not processed");
+    return {it->second.changed, it->second.renamed};
   };
 
-  helper = [&](const ref<Expr> &expr) -> std::pair<bool, ref<Expr>> {
-    if (dyn_cast<ConstantExpr>(expr))
-      return {false, expr};
+  enum class RenameFrameKind { Expr, Update };
+  struct RenameFrame {
+    RenameFrameKind kind;
+    ref<Expr> expr;
+    ref<UpdateNode> update;
+    bool expanded;
+  };
 
-    auto it = visited.find(expr);
-    if (it != visited.end())
-      return it->second;
+  std::vector<RenameFrame> stack;
+  auto pushExpr = [&](const ref<Expr> &expr) {
+    if (!expr || isa<ConstantExpr>(expr) || renameSecretCache.count(expr.get()))
+      return;
+    stack.push_back({RenameFrameKind::Expr, expr, nullptr, false});
+  };
+  auto pushUpdate = [&](const ref<UpdateNode> &node) {
+    if (!node || renameSecretUpdateCache.count(node.get()))
+      return;
+    stack.push_back({RenameFrameKind::Update, nullptr, node, false});
+  };
+
+  pushExpr(e);
+  while (!stack.empty()) {
+    RenameFrame frame = stack.back();
+    stack.pop_back();
+
+    if (frame.kind == RenameFrameKind::Update) {
+      if (!frame.update)
+        continue;
+
+      const UpdateNode *nodeKey = frame.update.get();
+      if (renameSecretUpdateCache.count(nodeKey))
+        continue;
+
+      if (!frame.expanded) {
+        stack.push_back(
+            {RenameFrameKind::Update, nullptr, frame.update, true});
+        pushExpr(frame.update->value);
+        pushExpr(frame.update->index);
+        pushUpdate(frame.update->next);
+        continue;
+      }
+
+      auto [nextChanged, newNext] = cachedUpdateResult(frame.update->next);
+      auto [idxChanged, newIdx] = cachedExprResult(frame.update->index);
+      auto [valChanged, newVal] = cachedExprResult(frame.update->value);
+
+      bool changed = nextChanged || idxChanged || valChanged;
+      ref<UpdateNode> renamed = changed
+          ? ref<UpdateNode>(new UpdateNode{newNext, newIdx, newVal})
+          : frame.update;
+
+      renameSecretUpdateCache.insert(
+          {nodeKey, {frame.update, changed, renamed}});
+      continue;
+    }
+
+    if (isa<ConstantExpr>(frame.expr))
+      continue;
+
+    const Expr *exprKey = frame.expr.get();
+    if (renameSecretCache.count(exprKey))
+      continue;
+
+    if (!frame.expanded) {
+      stack.push_back({RenameFrameKind::Expr, frame.expr, nullptr, true});
+
+      if (auto re = dyn_cast<ReadExpr>(frame.expr)) {
+        pushUpdate(re->updates.head);
+        pushExpr(re->index);
+      } else {
+        for (unsigned i = 0; i < frame.expr->getNumKids(); ++i)
+          pushExpr(frame.expr->getKid(i));
+      }
+      continue;
+    }
 
     std::pair<bool, ref<Expr>> result;
-
-    if (auto re = dyn_cast<ReadExpr>(expr)) {
+    if (auto re = dyn_cast<ReadExpr>(frame.expr)) {
       const Array *root = re->updates.root;
       const Array *newRoot = root;
       bool rootChanged = false;
@@ -4800,38 +4866,39 @@ std::pair<bool, ref<Expr>> Executor::renameSecret(const ref<Expr> &e) {
         rootChanged = true;
       }
 
-      auto [indexChanged, newIndex] = helper(re->index);
-      auto [updatesChanged, newHead] = helperUpdates(re->updates.head);
+      auto [indexChanged, newIndex] = cachedExprResult(re->index);
+      auto [updatesChanged, newHead] = cachedUpdateResult(re->updates.head);
 
       if (rootChanged || indexChanged || updatesChanged) {
         UpdateList newUpdates{newRoot, newHead};
         result = {true, ReadExpr::create(newUpdates, newIndex)};
       } else {
-        result = {false, expr};
+        result = {false, frame.expr};
       }
     } else {
       bool hasSecret = false;
       std::vector<ref<Expr>> kids;
-      kids.reserve(expr->getNumKids());
+      kids.reserve(frame.expr->getNumKids());
 
-      for (unsigned i = 0; i < expr->getNumKids(); ++i) {
-        auto [kidHasSecret, rebuiltKid] = helper(expr->getKid(i));
+      for (unsigned i = 0; i < frame.expr->getNumKids(); ++i) {
+        auto [kidHasSecret, rebuiltKid] =
+            cachedExprResult(frame.expr->getKid(i));
         hasSecret = hasSecret || kidHasSecret;
         kids.push_back(rebuiltKid);
       }
 
       if (hasSecret) {
-        result = {true, expr->rebuild(kids.data())};
+        result = {true, frame.expr->rebuild(kids.data())};
       } else {
-        result = {false, expr};
+        result = {false, frame.expr};
       }
     }
 
-    visited.insert({expr, result});
-    return result;
-  };
+    renameSecretCache.insert({exprKey, {frame.expr, result.first,
+                                        result.second}});
+  }
 
-  return helper(e);
+  return cachedExprResult(e);
 }
 
 std::pair<bool, ConstraintSet>

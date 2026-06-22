@@ -225,6 +225,32 @@ private:
   /// Map from secret symbolic names to their primed copies.
   std::map<std::string, const Array *> prime;
 
+  /// Cache entry for renameSecret(expr).
+  /// original pins the source node so the raw-pointer key stays valid while
+  /// cached; changed/renamed mirror renameSecret()'s return value.
+  struct RenameSecretExprCacheEntry {
+    ref<Expr> original;
+    bool changed;
+    ref<Expr> renamed;
+  };
+
+  /// Cache entry for renameSecret() over update-list nodes.
+  /// original is retained only for lifetime safety of the pointer key.
+  struct RenameSecretUpdateCacheEntry {
+    ref<UpdateNode> original;
+    bool changed;
+    ref<UpdateNode> renamed;
+  };
+
+  /// Cache for syntactic secret-to-prime expression renaming.
+  /// The maps are keyed by raw pointer for fast identity lookup, while each
+  /// entry keeps a strong ref to the original node so that address cannot be
+  /// freed and reused for a different node while cached. The cache is cleared
+  /// when a new secret prime array is created.
+  std::unordered_map<const Expr *, RenameSecretExprCacheEntry> renameSecretCache;
+  std::unordered_map<const UpdateNode *, RenameSecretUpdateCacheEntry>
+      renameSecretUpdateCache;
+
   /// Completed traces used for self-composition comparison.
   /// Each terminated state is compared against its primed copy and all earlier
   /// completed traces so later states can report same-path and cross-path
