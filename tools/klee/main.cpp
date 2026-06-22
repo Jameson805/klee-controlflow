@@ -1230,6 +1230,13 @@ linkWithUclibc(StringRef libDir, std::string opt_suffix,
     createLibCWrapper(modules, "main", "__uClibc_main");
   klee_message("NOTE: Using klee-uclibc : %s", uclibcBCA.c_str());
 
+  SmallString<128> ExplicitBzeroPath(libDir);
+  llvm::sys::path::append(
+      ExplicitBzeroPath, "libkleeRuntimeExplicitBzero" + opt_suffix + ".bca");
+  if (!klee::loadFile(ExplicitBzeroPath.c_str(), ctx, modules, errorMsg))
+    klee_error("error loading explicit_bzero support '%s': %s",
+               ExplicitBzeroPath.c_str(), errorMsg.c_str());
+
   // Link the fortified library
   SmallString<128> FortifyPath(libDir);
   llvm::sys::path::append(FortifyPath,
