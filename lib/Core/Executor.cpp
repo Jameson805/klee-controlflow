@@ -1374,31 +1374,23 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
   }
 
   state.addConstraint(condition);
-  // NEW: Duplicate constraint with secret symbolics replaced with primes
+  // The state-local concrete model is an original-side path model. Relational
+  // CT checks mirror it onto prime secrets when they need a renamed-side seed.
+  // Keep ordinary path repair on the original constraint set so straight-line
+  // programs do not repeatedly validate accumulated relational constraints.
   auto [hasSecret, renamedCond]{renameSecret(condition)};
   if (hasSecret) state.addRenamedConstraint(renamedCond);
 
   if (UseCvModel) {
-    ConstraintSet combinedConstraints = constraintsWithRenamed(state);
-    if (!assignmentSatisfies(state.concreteModel, combinedConstraints)) {
+    if (!evaluateAssignmentAsBool(state.concreteModel, condition)) {
       std::vector<const Array *> candidateObjects;
-      // Repair the concrete execution model over the state's original
-      // symbolics and prime secrets because CT checks also use renamed path
-      // constraints.
-      for (const auto &[_, array] : state.symbolics) {
+      for (const auto &[_, array] : state.symbolics)
         candidateObjects.push_back(array);
-        if (!array->isSecret)
-          continue;
-
-        auto it = prime.find(array->name);
-        assert(it != prime.end() && "secret symbolic not found in prime map");
-        candidateObjects.push_back(it->second);
-      }
 
       Assignment candidate;
       if (findCandidateAssignment(
               state, state.concreteModel, candidateObjects,
-            combinedConstraints, ConstantExpr::alloc(1, Expr::Bool), true,
+              state.constraints, ConstantExpr::alloc(1, Expr::Bool), true,
               "failed to repair concrete model after adding constraint",
               candidate) == CandidateAssignmentResult::Found) {
         state.concreteModel = candidate;
@@ -4793,8 +4785,6 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
           array->constantValues.data() + array->constantValues.size(),
           array->domain, array->range, false);
       prime[array->name] = {primeArray};
-      state.concreteModel.bindings[primeArray] =
-          std::vector<unsigned char>(primeArray->size, 0);
       renameSecretCache.clear();
       renameSecretUpdateCache.clear();
     }
@@ -5592,7 +5582,23 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
   allCtObjects.insert(allCtObjects.end(), primeSecretObjects.begin(),
                       primeSecretObjects.end());
 
-  auto addCurrentModelConstraints = [&](ConstraintManager &manager,
+  Assignment mirroredModel = state.concreteModel;
+  for (const auto &[_, array] : state.symbolics) {
+    if (!array->isSecret)
+      continue;
+
+    auto originalBinding = state.concreteModel.bindings.find(array);
+    if (originalBinding == state.concreteModel.bindings.end() ||
+        originalBinding->second.size() != array->size) {
+      klee_error("concrete model missing symbolic object binding");
+    }
+
+    auto primeIt = prime.find(array->name);
+    assert(primeIt != prime.end() && "secret symbolic not found in prime map");
+    mirroredModel.bindings[primeIt->second] = originalBinding->second;
+  }
+
+  auto addCurrentModelConstraints = [&](ConstraintSet &constraints,
                                         const std::vector<const Array *> &arrays) {
     for (const Array *array : arrays) {
       auto binding = state.concreteModel.bindings.find(array);
@@ -5602,7 +5608,11 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
       }
 
       for (unsigned arrayIndex = 0; arrayIndex < array->size; ++arrayIndex) {
-        manager.addConstraint(EqExpr::create(
+        // These byte equalities only pin the current model for the staged CT
+        // query. Running them through ConstraintManager::addConstraint() would
+        // rewrite the whole growing constraint set for every byte, which is
+        // expensive on SHA expression DAGs and unnecessary for satisfiability.
+        constraints.push_back(EqExpr::create(
             ReadExpr::create(UpdateList(array, 0),
                              ConstantExpr::alloc(arrayIndex,
                                                  array->getDomain())),
@@ -5650,19 +5660,17 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
 
   if (UseCvModel) {
     ConstraintSet fixedPublicConstraints{combinedConstraints};
-    ConstraintManager fixedPublicManager{fixedPublicConstraints};
-    addCurrentModelConstraints(fixedPublicManager, publicObjects);
+    addCurrentModelConstraints(fixedPublicConstraints, publicObjects);
 
     // Stage 1: use the same divergence expression, but fix public and secret1
     // to the current concrete model. Under those bindings/constraints, cond
     // evaluates concretely and only the renamed secret2 side is searched.
     // Candidate values are tried first as a cheap optimization of that solve.
     ConstraintSet fixedOriginalConstraints{fixedPublicConstraints};
-    ConstraintManager fixedOriginalManager{fixedOriginalConstraints};
-    addCurrentModelConstraints(fixedOriginalManager, originalSecretObjects);
+    addCurrentModelConstraints(fixedOriginalConstraints, originalSecretObjects);
     Assignment fixedOriginalWitness;
         if (findCandidateAssignment(
-            state, state.concreteModel, primeSecretObjects,
+            state, mirroredModel, primeSecretObjects,
             fixedOriginalConstraints, divergence, true,
             "get initial values failed for fixed original CT check",
           fixedOriginalWitness) == CandidateAssignmentResult::Found &&
@@ -5673,7 +5681,7 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     // Candidate secret pairs are tried first as a cheap optimization.
     Assignment fixedPublicWitness;
         if (findCandidateAssignment(
-            state, state.concreteModel, allSecretObjects,
+            state, mirroredModel, allSecretObjects,
             fixedPublicConstraints, divergence, true,
             "get initial values failed for fixed public CT check",
           fixedPublicWitness) == CandidateAssignmentResult::Found &&
@@ -5684,7 +5692,7 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     // to the full symbolic solve inside findCandidateAssignment.
     Assignment symbolicPublicWitness;
         if (findCandidateAssignment(
-            state, state.concreteModel, allCtObjects,
+            state, mirroredModel, allCtObjects,
             combinedConstraints, divergence, true,
             "get initial values failed for symbolic CT check",
           symbolicPublicWitness) != CandidateAssignmentResult::Found)
@@ -5731,7 +5739,7 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     return false;
   }
 
-  witness = state.concreteModel;
+  witness = mirroredModel;
   for (unsigned i{0}; i < objects.size(); ++i)
     witness.bindings[objects[i]] = values[i];
   if (!recordCtWitness(witness))
