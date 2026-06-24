@@ -1066,6 +1066,12 @@ void StatsTracker::computeReachableUncovered() {
   }
 }
 
+bool StatsTracker::hasNonCt(NonCtType type, KInstruction *ki) const {
+  const std::map<KInstruction *, NonCtInfo> &m{nonCtInfo[static_cast<size_t>(type)]};
+  auto it = m.find(ki);
+  return it != m.end() && it->second.nonCtCount > 0;
+}
+
 bool StatsTracker::visitNonCt(NonCtType type, bool isNonCt, KInstruction *ki, double time) {
   std::map<KInstruction *, NonCtInfo> &m{nonCtInfo[static_cast<size_t>(type)]};
   NonCtInfo &info = m[ki];

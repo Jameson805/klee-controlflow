@@ -187,6 +187,11 @@ cl::opt<bool>
                                   "querying the solver (default=true)"),
                          cl::cat(SolvingCat));
 
+cl::opt<bool> SkipKnownNonCtChecks(
+  "skip-known-non-ct-checks", cl::init(true),
+  cl::desc("Skip repeated non-CT checks for an instruction after the first non-CT witness is found (default=true)"),
+  cl::cat(SolvingCat));
+
 
 /*** External call policy options ***/
 
@@ -6222,6 +6227,9 @@ void Executor::checkLogCounterexample(NonCtType type, const ExecutionState &stat
   // executed, and state.pc is the *next* instruction.
   KInstruction *ki = state.prevPC;
   if (!ki)
+    return;
+
+  if (SkipKnownNonCtChecks && statsTracker->hasNonCt(type, ki))
     return;
 
   bool nonCt = false;
