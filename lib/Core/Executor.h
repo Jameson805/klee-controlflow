@@ -578,14 +578,14 @@ private:
   /// solver/model extraction failed before that conclusion was available.
   enum class CandidateAssignmentResult { Found, Unsat, Error };
 
-  /// Try fixed and random candidate assignments before asking the solver for
-  /// the arrays named by candidateObjects under expr == desiredValue. The
-  /// warning string must be non-null.
+  /// Try optional fixed values and random candidate assignments before asking
+  /// the solver for the arrays named by candidateObjects under
+  /// expr == desiredValue. The warning string must be non-null.
   CandidateAssignmentResult findCandidateAssignment(
       const ExecutionState &state, const Assignment &baseAssignment,
       const std::vector<const Array *> &candidateObjects,
       const ConstraintSet &baseConstraints,
-      const ref<Expr> &expr, bool desiredValue,
+      const ref<Expr> &expr, bool desiredValue, bool tryFixedValues,
       const char *warning, Assignment &assignment);
 
   /// Main CT witness entrypoint for one branch or memory expression. It builds

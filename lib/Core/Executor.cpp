@@ -1079,8 +1079,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     bool oppositeSide = !modelSide;
     CandidateAssignmentResult oppositeResult = findCandidateAssignment(
         current, current.concreteModel, candidateObjects, current.constraints,
-        condition, oppositeSide, "get initial values failed for opposite branch",
-        oppositeAssignment);
+        condition, oppositeSide, true,
+        "get initial values failed for opposite branch", oppositeAssignment);
 
     if (oppositeResult == CandidateAssignmentResult::Found) {
       TimerStatIncrementer timer(stats::forkTime);
@@ -1390,7 +1390,7 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
       Assignment candidate;
       if (findCandidateAssignment(
               state, state.concreteModel, candidateObjects,
-              state.constraints, ConstantExpr::alloc(1, Expr::Bool), true,
+              state.constraints, ConstantExpr::alloc(1, Expr::Bool), true, true,
               "failed to repair concrete model after adding constraint",
               candidate) == CandidateAssignmentResult::Found) {
         state.concreteModel = candidate;
@@ -5443,7 +5443,8 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
     const ExecutionState &state, const Assignment &baseAssignment,
     const std::vector<const Array *> &candidateObjects,
     const ConstraintSet &baseConstraints, const ref<Expr> &expr,
-    bool desiredValue, const char *warning, Assignment &assignment) {
+    bool desiredValue, bool tryFixedValues, const char *warning,
+    Assignment &assignment) {
   ++stats::candidateModelQueries;
 
   if (candidateObjects.empty()) return CandidateAssignmentResult::Unsat;
@@ -5473,14 +5474,23 @@ Executor::CandidateAssignmentResult Executor::findCandidateAssignment(
         std::fill(bytes.begin(), bytes.end(), (BYTE_VALUE));                 \
       }                                                                      \
     }                                                                        \
-    TRY_CANDIDATE();                                                         \
+    AssignmentEvaluator evaluator{candidate};                                \
+    if (assignmentSatisfies(evaluator, baseConstraints) &&                   \
+        evaluateAssignmentAsBool(evaluator, expr) == desiredValue) {         \
+      assignment = candidate;                                                \
+      ++stats::candidateModelHits;                                           \
+      return CandidateAssignmentResult::Found;                               \
+    }                                                                        \
   } while (false)
 
-  // Try simple non-zero fixed values before falling back to random probing and
+  // Try simple fixed values before falling back to random probing and
   // the solver. Broader fixed patterns were measured as too sparse to justify
   // their per-query evaluation cost on the RSA CT workload.
-  TRY_FIXED_CANDIDATE(0x01, true);
-  TRY_FIXED_CANDIDATE(0xff, false);
+  if (tryFixedValues) {
+    TRY_FIXED_CANDIDATE(0x00, true);
+    TRY_FIXED_CANDIDATE(0x01, true);
+    TRY_FIXED_CANDIDATE(0xff, false);
+  }
 
   for (unsigned randomCandidate = 0; randomCandidate < CvModelRandomCandidates;
        ++randomCandidate) {
@@ -5669,33 +5679,36 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
     ConstraintSet fixedOriginalConstraints{fixedPublicConstraints};
     addCurrentModelConstraints(fixedOriginalConstraints, originalSecretObjects);
     Assignment fixedOriginalWitness;
-        if (findCandidateAssignment(
+    if (findCandidateAssignment(
             state, mirroredModel, primeSecretObjects,
             fixedOriginalConstraints, divergence, true,
+            true,
             "get initial values failed for fixed original CT check",
-          fixedOriginalWitness) == CandidateAssignmentResult::Found &&
+            fixedOriginalWitness) == CandidateAssignmentResult::Found &&
         recordCtWitness(fixedOriginalWitness))
       return true;
 
     // Stage 2: keep current public fixed, then solve for secret1 and secret2.
     // Candidate secret pairs are tried first as a cheap optimization.
     Assignment fixedPublicWitness;
-        if (findCandidateAssignment(
+    if (findCandidateAssignment(
             state, mirroredModel, allSecretObjects,
             fixedPublicConstraints, divergence, true,
+            false,
             "get initial values failed for fixed public CT check",
-          fixedPublicWitness) == CandidateAssignmentResult::Found &&
+            fixedPublicWitness) == CandidateAssignmentResult::Found &&
         recordCtWitness(fixedPublicWitness))
       return true;
 
     // Stage 3: try chosen public/secret1/secret2 values first, then fall back
     // to the full symbolic solve inside findCandidateAssignment.
     Assignment symbolicPublicWitness;
-        if (findCandidateAssignment(
+    if (findCandidateAssignment(
             state, mirroredModel, allCtObjects,
             combinedConstraints, divergence, true,
+            false,
             "get initial values failed for symbolic CT check",
-          symbolicPublicWitness) != CandidateAssignmentResult::Found)
+            symbolicPublicWitness) != CandidateAssignmentResult::Found)
       return false;
     return recordCtWitness(symbolicPublicWitness);
   }
