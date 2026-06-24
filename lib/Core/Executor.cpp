@@ -4985,12 +4985,17 @@ Executor::findDivergences(const CompletedTrace &left,
     appliedConstraints = targetCount;
   };
   auto isFeasible = [&](const ConstraintSet &constraints,
-                        const ref<Expr> &query) {
-    bool result = false;
+                        const ref<Expr> &query, bool &result) {
+    if (haltExecution) {
+      return false;
+    }
+    // Self-composition compares completed traces at path exit, outside the
+    // usual executor query sites, so it must arm the core solver timeout here.
+    solver->setTimeout(coreSolverTimeout);
     bool success = solver->mayBeTrue(constraints, query, result,
                                      state.queryMetaData);
-    assert(success && "FIXME: Unhandled solver failure");
-    return result;
+    solver->setTimeout(time::Span());
+    return success;
   };
   ref<Expr> trueExpr = ConstantExpr::alloc(1, Expr::Bool);
   unsigned index = 0;
@@ -5003,7 +5008,11 @@ Executor::findDivergences(const CompletedTrace &left,
     extendPrefixConstraints(right.pathConstraints, rightAppliedConstraints,
                             rightEvent.prefixConstraintIndex);
 
-    if (!isFeasible(matchedPrefixConstraints, trueExpr)) {
+    bool prefixFeasible = false;
+    if (!isFeasible(matchedPrefixConstraints, trueExpr, prefixFeasible)) {
+      return divergences;
+    }
+    if (!prefixFeasible) {
       SelfCompDivergence divergence;
       divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
       divergence.index = index;
@@ -5037,7 +5046,11 @@ Executor::findDivergences(const CompletedTrace &left,
         EqExpr::create(leftEvent.observedValue, rightEvent.observedValue);
     ref<Expr> differs =
         NeExpr::create(leftEvent.observedValue, rightEvent.observedValue);
-    if (isFeasible(matchedPrefixConstraints, differs)) {
+    bool differsFeasible = false;
+    if (!isFeasible(matchedPrefixConstraints, differs, differsFeasible)) {
+      return divergences;
+    }
+    if (differsFeasible) {
       SelfCompDivergence divergence;
       divergence.index = index;
       divergence.leftSiteId = leftEvent.siteId;
@@ -5056,7 +5069,11 @@ Executor::findDivergences(const CompletedTrace &left,
       divergences.push_back(divergence);
     }
 
-    if (!isFeasible(matchedPrefixConstraints, equals)) {
+    bool equalsFeasible = false;
+    if (!isFeasible(matchedPrefixConstraints, equals, equalsFeasible)) {
+      return divergences;
+    }
+    if (!equalsFeasible) {
       return divergences;
     }
 
@@ -5077,7 +5094,11 @@ Executor::findDivergences(const CompletedTrace &left,
   }
 
   SelfCompDivergence divergence;
-  if (!isFeasible(matchedPrefixConstraints, trueExpr)) {
+  bool prefixFeasible = false;
+  if (!isFeasible(matchedPrefixConstraints, trueExpr, prefixFeasible)) {
+    return divergences;
+  }
+  if (!prefixFeasible) {
     divergence.kind = SelfCompDivergenceKind::UnlocalizablePrefixInfeasible;
   } else {
     divergence.kind = SelfCompDivergenceKind::UnlocalizableLengthMismatch;
