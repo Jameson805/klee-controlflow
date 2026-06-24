@@ -3989,60 +3989,76 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bindLocal(ki, state, ConstantExpr::alloc(Result, Expr::Bool));
     break;
   }
+    // Aggregate and vector value operations must stay in the product-program
+    // register file. Vector element indices keep KLEE's existing limitation:
+    // they must be concrete and identical on both sides.
   case Instruction::InsertValue: {
     KGEPInstruction *kgepi = static_cast<KGEPInstruction*>(ki);
 
-    ref<Expr> agg = eval(ki, 0, state).value;
-    ref<Expr> val = eval(ki, 1, state).value;
+    Dual agg = evalDual(ki, 0, state);
+    Dual val = evalDual(ki, 1, state);
+    assert(agg.left && agg.right && val.left && val.right &&
+           "missing Dual operands");
 
-    ref<Expr> l = NULL, r = NULL;
-    unsigned lOffset = kgepi->offset*8, rOffset = kgepi->offset*8 + val->getWidth();
+    auto insertValue = [&](ref<Expr> aggregate, ref<Expr> value) {
+      ref<Expr> l = NULL, r = NULL;
+      unsigned lOffset = kgepi->offset*8;
+      unsigned rOffset = kgepi->offset*8 + value->getWidth();
 
-    if (lOffset > 0)
-      l = ExtractExpr::create(agg, 0, lOffset);
-    if (rOffset < agg->getWidth())
-      r = ExtractExpr::create(agg, rOffset, agg->getWidth() - rOffset);
+      if (lOffset > 0)
+        l = ExtractExpr::create(aggregate, 0, lOffset);
+      if (rOffset < aggregate->getWidth())
+        r = ExtractExpr::create(aggregate, rOffset,
+                                aggregate->getWidth() - rOffset);
 
-    ref<Expr> result;
-    if (l && r)
-      result = ConcatExpr::create(r, ConcatExpr::create(val, l));
-    else if (l)
-      result = ConcatExpr::create(val, l);
-    else if (r)
-      result = ConcatExpr::create(r, val);
-    else
-      result = val;
+      if (l && r)
+        return ConcatExpr::create(r, ConcatExpr::create(value, l));
+      if (l)
+        return ConcatExpr::create(value, l);
+      if (r)
+        return ConcatExpr::create(r, value);
+      return value;
+    };
 
-    bindLocal(ki, state, result);
+    bindLocalWithDual(Dual{insertValue(agg.left, val.left),
+                           insertValue(agg.right, val.right)});
     break;
   }
   case Instruction::ExtractValue: {
     KGEPInstruction *kgepi = static_cast<KGEPInstruction*>(ki);
 
-    ref<Expr> agg = eval(ki, 0, state).value;
+    Dual agg = evalDual(ki, 0, state);
+    assert(agg.left && agg.right && "missing Dual operand");
 
-    ref<Expr> result = ExtractExpr::create(agg, kgepi->offset*8, getWidthForLLVMType(i->getType()));
+    unsigned offset = kgepi->offset*8;
+    Expr::Width width = getWidthForLLVMType(i->getType());
 
-    bindLocal(ki, state, result);
+    bindLocalWithDual(Dual{ExtractExpr::create(agg.left, offset, width),
+                           ExtractExpr::create(agg.right, offset, width)});
     break;
   }
   case Instruction::Fence: {
     // Ignore for now
     break;
   }
+
   case Instruction::InsertElement: {
     InsertElementInst *iei = cast<InsertElementInst>(i);
-    ref<Expr> vec = eval(ki, 0, state).value;
-    ref<Expr> newElt = eval(ki, 1, state).value;
-    ref<Expr> idx = eval(ki, 2, state).value;
+    Dual vec = evalDual(ki, 0, state);
+    Dual newElt = evalDual(ki, 1, state);
+    Dual idx = evalDual(ki, 2, state);
+    assert(vec.left && vec.right && newElt.left && newElt.right && idx.left &&
+           idx.right && "missing Dual operands");
 
-    ConstantExpr *cIdx = dyn_cast<ConstantExpr>(idx);
-    if (cIdx == NULL) {
+    ConstantExpr *cIdxLeft = dyn_cast<ConstantExpr>(idx.left);
+    ConstantExpr *cIdxRight = dyn_cast<ConstantExpr>(idx.right);
+    if (cIdxLeft == NULL || cIdxRight == NULL ||
+        cIdxLeft->getZExtValue() != cIdxRight->getZExtValue()) {
       terminateStateOnExecError(
-          state, "InsertElement, support for symbolic index not implemented");
+          state, "InsertElement, support for symbolic or divergent index not implemented");
       return;
     }
-    uint64_t iIdx = cIdx->getZExtValue();
+    uint64_t iIdx = cIdxLeft->getZExtValue();
     const auto *vt = cast<llvm::FixedVectorType>(iei->getType());
     unsigned EltBits = getWidthForLLVMType(vt->getElementType());
 
@@ -4055,32 +4071,40 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     }
 
     const unsigned elementCount = vt->getNumElements();
-    llvm::SmallVector<ref<Expr>, 8> elems;
-    elems.reserve(elementCount);
-    for (unsigned i = elementCount; i != 0; --i) {
-      auto of = i - 1;
-      unsigned bitOffset = EltBits * of;
-      elems.push_back(
-          of == iIdx ? newElt : ExtractExpr::create(vec, bitOffset, EltBits));
-    }
+    auto insertElement = [&](ref<Expr> vector, ref<Expr> element) {
+      llvm::SmallVector<ref<Expr>, 8> elems;
+      elems.reserve(elementCount);
+      for (unsigned i = elementCount; i != 0; --i) {
+        auto of = i - 1;
+        unsigned bitOffset = EltBits * of;
+        elems.push_back(of == iIdx
+                            ? element
+                            : ExtractExpr::create(vector, bitOffset, EltBits));
+      }
+      return ConcatExpr::createN(elementCount, elems.data());
+    };
 
     assert(Context::get().isLittleEndian() && "FIXME:Broken for big endian");
-    ref<Expr> Result = ConcatExpr::createN(elementCount, elems.data());
-    bindLocal(ki, state, Result);
+    bindLocalWithDual(Dual{insertElement(vec.left, newElt.left),
+                           insertElement(vec.right, newElt.right)});
     break;
   }
   case Instruction::ExtractElement: {
     ExtractElementInst *eei = cast<ExtractElementInst>(i);
-    ref<Expr> vec = eval(ki, 0, state).value;
-    ref<Expr> idx = eval(ki, 1, state).value;
+    Dual vec = evalDual(ki, 0, state);
+    Dual idx = evalDual(ki, 1, state);
+    assert(vec.left && vec.right && idx.left && idx.right &&
+           "missing Dual operands");
 
-    ConstantExpr *cIdx = dyn_cast<ConstantExpr>(idx);
-    if (cIdx == NULL) {
+    ConstantExpr *cIdxLeft = dyn_cast<ConstantExpr>(idx.left);
+    ConstantExpr *cIdxRight = dyn_cast<ConstantExpr>(idx.right);
+    if (cIdxLeft == NULL || cIdxRight == NULL ||
+        cIdxLeft->getZExtValue() != cIdxRight->getZExtValue()) {
       terminateStateOnExecError(
-          state, "ExtractElement, support for symbolic index not implemented");
+          state, "ExtractElement, support for symbolic or divergent index not implemented");
       return;
     }
-    uint64_t iIdx = cIdx->getZExtValue();
+    uint64_t iIdx = cIdxLeft->getZExtValue();
     const auto *vt = cast<llvm::FixedVectorType>(eei->getVectorOperandType());
     unsigned EltBits = getWidthForLLVMType(vt->getElementType());
 
@@ -4093,8 +4117,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     }
 
     unsigned bitOffset = EltBits * iIdx;
-    ref<Expr> Result = ExtractExpr::create(vec, bitOffset, EltBits);
-    bindLocal(ki, state, Result);
+    bindLocalWithDual(Dual{ExtractExpr::create(vec.left, bitOffset, EltBits),
+                           ExtractExpr::create(vec.right, bitOffset, EltBits)});
     break;
   }
   case Instruction::ShuffleVector:
