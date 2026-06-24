@@ -190,6 +190,11 @@ cl::opt<unsigned> CvModelRandomCandidates(
   cl::desc("Number of deterministic random assignments to try after the fixed chosen-value candidates (default=1)"),
     cl::cat(SolvingCat));
 
+cl::opt<bool> SkipKnownNonCtChecks(
+    "skip-known-non-ct-checks", cl::init(true),
+    cl::desc("Skip repeated non-CT checks for an instruction after the first non-CT witness is found (default=true)"),
+    cl::cat(SolvingCat));
+
 
 /*** External call policy options ***/
 
@@ -5762,6 +5767,9 @@ bool Executor::getCounterexample(NonCtType type, Assignments &assignments, const
 
 bool Executor::checkLogCounterexample(NonCtType type, const ExecutionState &state, KInstruction *ki, const ref<Expr> &cond)
 {
+  if (SkipKnownNonCtChecks && statsTracker->hasNonCt(type, ki))
+    return true;
+
   Assignments assignments;
   bool nonCt{getCounterexample(type, assignments, state, cond)};
 

@@ -117,6 +117,7 @@ namespace klee {
     void computeReachableUncovered();
 
     // Record branch and memory access info, return if there was no counterexample before
+    bool hasNonCt(NonCtType type, KInstruction *ki) const;
     bool visitNonCt(NonCtType type, bool isNonCt, KInstruction *ki, double time);
     void printNonCt();
   };
